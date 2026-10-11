@@ -1,0 +1,19 @@
+[project]
+name = "fpv-conductor"
+version = "0.1.0"
+description = "Python tooling for conducting FPV with OSS"
+readme = "README.md"
+authors = [
+    { name = "Rupert Swarbrick", email = "rswarbrick@lowrisc.org" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "psutil",
+]
+
+[project.scripts]
+fpv-conductor = "fpv_conductor:main"
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
