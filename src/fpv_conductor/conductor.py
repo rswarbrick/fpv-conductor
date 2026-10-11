@@ -720,7 +720,7 @@ async def explore_mode(by_step: list[list[str]]):
         else:
             log(f"Skipping proof run for step {step}, since it has just one step", c=white)
 
-async def main():
+async def async_main():
     global process_runner
 
     def preproc_name(name: str) -> tuple[int, str]:
@@ -787,4 +787,6 @@ async def main():
         case "explore":
             await explore_mode(by_step)
 
-asyncio.run(main())
+
+def main():
+    asyncio.run(async_main())
