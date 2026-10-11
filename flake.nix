@@ -26,6 +26,12 @@
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    aig-manip = {
+      url = "https://github.com/rswarbrick/aig-manip";
+      type = "git";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -36,6 +42,7 @@
       pyproject-nix,
       pyproject-build-systems,
       fenix,
+      aig-manip,
       ... }:
     flake-utils.lib.eachDefaultSystem (system: let
       workspace = uv2nix.lib.workspace.loadWorkspace {workspaceRoot = ./.;};
@@ -93,6 +100,11 @@
         buildInputs = [ pkgs.stdenv.cc.cc.lib ];
         src = ric3_src;
       };
+      # Packages that need to be visible on PATH for fpv-conductor to work properly
+      app-deps = [
+        ric3
+        aig-manip.packages.${system}.default
+      ];
     in {
       packages.default =
         let
@@ -107,7 +119,7 @@
             buildInputs = [ pkgs.makeWrapper ];
             postBuild = ''
               wrapProgram $out/bin/fpv-conductor \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ ric3 ]}
+                --prefix PATH : ${pkgs.lib.makeBinPath app-deps}
             '';
           };
 
@@ -120,9 +132,7 @@
         packages = [
           virtualenv
           pkgs.uv
-
-          ric3
-        ];
+        ] ++ app-deps;
 
         env = {
           UV_NO_SYNC = "1";
