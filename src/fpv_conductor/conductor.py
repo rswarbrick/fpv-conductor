@@ -838,15 +838,18 @@ async def explore_mode(root_hash: str,
         else:
             log(f"Skipping proof run for step {step}, since it has just one step", c=white)
 
+
+def split_step_name(name: str) -> tuple[int, str]:
+    '''Split a step name that should be of the form "Step123_foo" into (123, 'foo')'''
+    m = re.match('Step([0-9]+)_(.*)', name)
+    if not m:
+        msg = (f"Failed to extract step from assertion name {name}. "
+               "We expect the form 'Step123_foo'.")
+        raise ValueError(msg)
+    return int(m.group(1)), m.group(2)
+
 async def async_main(args: argparse.Namespace, root_hash: str, bd: BuildDir):
     global process_runner
-
-    def preproc_name(name: str) -> tuple[int, str]:
-        first = name.split("$")[1][5:]
-        assert first.startswith("Step")
-        step, rest = first.split("_", maxsplit=1)
-        step = int(step[4:])
-        return step, rest
 
     def group_by_step(names: list[tuple[int, str]], max=None) -> list[list[str]]:
         by_step = []
@@ -871,7 +874,7 @@ async def async_main(args: argparse.Namespace, root_hash: str, bd: BuildDir):
     if not asserts:
         raise ValueError(f"The ywmap at {ywmap_path} has no asserts.")
 
-    preproc_names = [preproc_name(x[0]) for x in asserts]
+    preproc_names = [split_step_name(x[0]) for x in asserts]
 
     max_step = max(step for step, _ in preproc_names)
     names = [(step, name) for step, name in preproc_names
