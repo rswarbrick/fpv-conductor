@@ -298,11 +298,13 @@ class ProcessRunner:
     POLL_DELAY = 0.1 # Time between poll cycles
     MAX_RUNNING = (psutil.cpu_count() or 8) - 2 # Number of CPUs, with a couple spares
 
-    def __init__(self):
+    def __init__(self, args):
         self.pending = []
         self.running = []
         self.first_start = time.time()
         self.debug_count = 0
+
+        self.args = args
 
         log(f"Process runner will have a maximum of {ProcessRunner.MAX_RUNNING} processes, and currently sees {self.mem_avail():.3f}GB free.")
 
@@ -316,14 +318,14 @@ class ProcessRunner:
         return sum(proc.max_memory for proc in self.running)
 
     def mem_avail(self):
-        if args.max_mem == 0:
+        if self.args.max_mem == 0:
             return global_memory_free()
-        return min(global_memory_free(), max(args.max_mem - self.children_used_mem(), 0))
+        return min(global_memory_free(), max(self.args.max_mem - self.children_used_mem(), 0))
 
     def poll(self):
         # Kill recently started processes until memory is OK, unless there is just one, then there's no point(?)
         free = self.mem_avail()
-        while not args.no_kill and free < ProcessRunner.GLOBAL_MEMORY_BUFFER and len(self.running) > 1:
+        while not self.args.no_kill and free < ProcessRunner.GLOBAL_MEMORY_BUFFER and len(self.running) > 1:
             last = self.running.pop()
             last.kill_restart()
             free += max(last.max_memory, 3)
@@ -380,10 +382,15 @@ async def prepare_aiger(step: int, props: list[str], bd: BuildDir) -> str:
     return name
 
 '''Log a nice message on proof completion, and store in the proof log'''
-def proof_done(engine_config: str, path: str, step: int, props: list[str], procres: ProcessResult):
+def proof_done(engine_config: str,
+               root_hash: str,
+               path: str,
+               step: int,
+               props: list[str],
+               procres: ProcessResult):
     if not "NO_LOG" in os.environ:
         with open(PROOFLOG, "a") as f:
-            json.dump([time.time(), [props, step, ROOT_HASH, engine_config], vars(procres)], f)
+            json.dump([time.time(), [props, step, root_hash, engine_config], vars(procres)], f)
             f.write("\n")
     match procres.code:
         case 20:
@@ -418,6 +425,7 @@ def proof_done(engine_config: str, path: str, step: int, props: list[str], procr
 
 '''Prove some properties with the given config'''
 async def prove(engine_config: str,
+                root_hash: str,
                 step: int,
                 props: list[str],
                 bd: BuildDir,
@@ -425,19 +433,25 @@ async def prove(engine_config: str,
                 expected_memory=10.0) -> ProcessResult:
     specialised = await prepare_aiger(step, props, bd)
     res = await shell(f"{engine_config} {specialised}", timeout=timeout, expected_memory=expected_memory)
-    proof_done(engine_config, specialised, step, props, res)
+    proof_done(engine_config, root_hash, specialised, step, props, res)
     return res
 
 cex_id = 0
 '''Run Bounded Model Checking on some properties'''
-async def bmc(step: int,
+async def bmc(root_hash: str,
+              step: int,
               props: list[str],
               bd: BuildDir,
               timeout=None,
               start=None,
               end=None) -> ProcessResult:
     global cex_id
-    res = await prove("rIC3 -e bmc --no-preproc --witness" + ("" if start is None else f" --start {start}") + ("" if end is None else f" --end {end}"), step, props, bd, timeout=timeout)
+
+    engine_cfg = ("rIC3 -e bmc --no-preproc --witness" +
+                  ("" if start is None else f" --start {start}") +
+                  ("" if end is None else f" --end {end}"))
+
+    res = await prove(engine_cfg, root_hash, step, props, bd, timeout=timeout)
     if res.code == 10:
         assert res.stdout is not None
         own_id = cex_id
@@ -453,7 +467,8 @@ async def bmc(step: int,
 # -------------------------- Proof Exploration -----------------------
 
 '''Try several configurations for some properties and see which is best, if any'''
-async def explore(step: int,
+async def explore(root_hash: str,
+                  step: int,
                   props: list[str],
                   configs: list[tuple[str, float]],
                   bd: BuildDir,
@@ -463,7 +478,7 @@ async def explore(step: int,
 
     async def explore_one(engine_config, expected_memory):
         result = await shell(f"{engine_config} {specialised}", timeout=timeout, expected_memory=expected_memory, debug_slow=debug_slow)
-        proof_done(engine_config, specialised, step, props, result)
+        proof_done(engine_config, root_hash, specialised, step, props, result)
         if result.code in {10, 20}:
             return engine_config, result
 
@@ -480,7 +495,8 @@ class Strategy:
         self.procres: ProcessResult = procres
 
 '''Build a strategy for the given tree, where in each case we either split into subtrees, or prove as a block. A strategy is a flat list of proof instructions.'''
-async def build_strategy_rec(step: int,
+async def build_strategy_rec(root_hash: str,
+                             step: int,
                              prop_tree: list,
                              failures: list[tuple[int, str]],
                              bd: BuildDir,
@@ -516,7 +532,8 @@ async def build_strategy_rec(step: int,
 
     if len(all_props) == 1:
         while True:
-            res = await explore(step,
+            res = await explore(root_hash,
+                                step,
                                 all_props,
                                 configs=ENGINES,
                                 bd=bd,
@@ -534,10 +551,10 @@ async def build_strategy_rec(step: int,
             return []
 
     if len(prop_tree) == 1:
-        return await build_strategy_rec(step, prop_tree[0], failures, bd, difficult=difficult)
+        return await build_strategy_rec(root_hash, step, prop_tree[0], failures, bd, difficult=difficult)
 
     async def without_split():
-        res = await explore(step, all_props, configs=ENGINES, bd=bd, timeout=120.0)
+        res = await explore(root_hash, step, all_props, configs=ENGINES, bd=bd, timeout=120.0)
         if res is not None:
             if res[1].code == 20:
                 log(f"Constructed proof for {len(all_props)} properties in step {step}: {' '.join(all_props)}", c=green)
@@ -560,10 +577,12 @@ async def build_strategy_rec(step: int,
             await asyncio.sleep(20.0) # Give the rest a tiny head start anyway
 
         if len(children) == 0:
-            solutions = await asyncio.gather(*[build_strategy_rec(step, [child], failures, bd, difficult=difficult) for child in rest])
+            solutions = await asyncio.gather(*[build_strategy_rec(root_hash, step, [child], failures,
+                                                                  bd, difficult=difficult) for child in rest])
         else:
             children.append(rest)
-            solutions = await asyncio.gather(*[build_strategy_rec(step, tree, failures, bd, difficult=difficult) for tree in children])
+            solutions = await asyncio.gather(*[build_strategy_rec(root_hash, step, tree, failures,
+                                                                  bd, difficult=difficult) for tree in children])
         flattened = []
         for solution in solutions:
             flattened.extend(solution)
@@ -574,7 +593,7 @@ async def build_strategy_rec(step: int,
     return winner
 
 '''Execute a given strategy, return all the (result, strategy)'''
-async def run_strategy(strategy: list[Strategy], bd: BuildDir) -> list[tuple[ProcessResult, Strategy]]:
+async def run_strategy(root_hash: str, strategy: list[Strategy], bd: BuildDir) -> list[tuple[ProcessResult, Strategy]]:
     proofs = []
     strategy.sort(key=lambda x: x.procres.dt, reverse=True)
     for step in strategy:
@@ -584,7 +603,8 @@ async def run_strategy(strategy: list[Strategy], bd: BuildDir) -> list[tuple[Pro
                 s = step.procres.stderr.split("[INFO ] k-induction proofed in depth ")
                 if len(s) == 2:
                     conf += f" --start {int(s[1].strip())}"
-        proofs.append(prove(conf, step.step, step.props, bd, expected_memory=step.procres.max_mem * 1.1))
+        proofs.append(prove(conf, root_hash, step.step, step.props, bd,
+                            expected_memory=step.procres.max_mem * 1.1))
     return list(zip(await asyncio.gather(*proofs), strategy))
 
 '''Construct a proof tree by recursively splitting on the prefix of a name, for example a_x, a_y, b will produce [[a_x, a_y], b]'''
@@ -616,66 +636,39 @@ def split_by_prefixes(names: list[str]) -> list:
 
 # ---------------------------------- Main ------------------------------
 
-parser = argparse.ArgumentParser(prog="conductor.py", description="Constructs and executes proofs.", epilog="Additionally, the PROOFLOG env var sets the prooflog file (i.e. one proof result per line, JSON), and the LOGFILE env var sets the logging file.")
-parser.add_argument("mode", choices=["prove", "explore", "bmc", "info"],
-                    help="Proof mode. "
-                    "prove will run existing proofs where they exist, "
-                    "explore will attempt to discover new proofs, "
-                    "bmc will do bounded model checking on each property individually, "
-                    "info dumps stats about cached proofs.")
-parser.add_argument("--build-dir", type=Path, default=Path("build"), help="The directory in which to work")
-parser.add_argument("--fresh", action="store_true", help="In explore mode, do not use already constructed proofs, always construct new proofs.")
-parser.add_argument("--no-store", action="store_true", help="In explore mode, do not store constructed proof strategies.")
-parser.add_argument("--by-step", action="store_true", help="In prove mode, do proofs one step at a time")
-parser.add_argument("-p", "--properties", nargs="*", default=[], help="Restrict to only the properties with the given names, otherwise all properties. Especially helpful for BMC.")
-parser.add_argument("--missing", action="store_true", help="Equivalent to -p <each property that is not skipped but has no proof in a step where there are some proofs>")
-parser.add_argument("-s", "--start", type=int, default=0, help="First step to start at. (default: 0)")
-parser.add_argument("--bmc-step", type=int, default=1, help="Step size for BMC. (default: 1)")
-parser.add_argument("--bmc-start", type=int, default=4, help="Start length for BMC. (default: 4)")
-parser.add_argument("--hard", action="store_true", help="In explore mode, try harder to prove properties (1hr timeout, more engines).")
-parser.add_argument("--no-run", action="store_true", help="In explore mode don't run proofs again to check steps.")
-parser.add_argument("--no-kill", action="store_true", help="Don't kill proof processes due to running out of memory.")
-parser.add_argument("--check-complete", action="store_true", help="In prove mode, fail if there are unskipped properties without proofs.")
-parser.add_argument("--max-mem", type=float, default=0, help="Max memory in GB, otherwise use all available memory")
-args = parser.parse_args()
 
-if len(SKIPPED_PROPS) > 0:
-    log(f"WARNING: Skipped properties are {' '.join(SKIPPED_PROPS)}", c=orange)
-
-bd = BuildDir(args.build_dir)
-
-ROOT_HASH = hashlib.new("sha256", bd.filepath(bd.aig).read_bytes()).hexdigest()
-log(f"{bd.filepath(bd.aig)} has sha256 {ROOT_HASH}")
-
-def decode_strategy(encoded: list) -> Strategy:
+def decode_strategy(encoded: list, fresh: bool) -> Strategy:
     return Strategy(encoded[0], encoded[1], encoded[2], ProcessResult(encoded[3][0], encoded[3][3], encoded[3][1], encoded[3][2], encoded[3][4] if len(encoded[3]) > 4 else None, encoded[3][5] if len(encoded[3]) > 5 else None))
 
-def load_strategy(step: int) -> list[Strategy] | None:
-    if args.fresh:
+def load_strategy(step: int, fresh: bool) -> list[Strategy] | None:
+    if fresh:
         return None
     try:
         with open(f"strategies/step{step}.json", "r") as f:
             log(f"Loading strategy for step {step} from cache", c=white)
             encoded = json.load(f)
-        return [decode_strategy(d) for d in encoded]
+        return [decode_strategy(d, fresh) for d in encoded]
     except FileNotFoundError:
         pass
     except json.JSONDecodeError as e:
         log(f"Error decoding step{step}.json (ignoring): {e}", c=red)
     return None
 
-def store_strategy(step: int, strategy: list[Strategy]):
+def store_strategy(step: int,
+                   strategy: list[Strategy],
+                   fresh: bool,
+                   no_store: bool):
     encoded = [[s.step, s.props, s.config, [s.procres.code, s.procres.max_mem, s.procres.dt, s.procres.reason, s.procres.stdout, s.procres.stderr]] for s in strategy]
     log(encoded, c=gray)
-    if args.no_store:
-        return [decode_strategy(d) for d in encoded]
+    if no_store:
+        return [decode_strategy(d, fresh) for d in encoded]
     try:
         os.makedirs("strategies", exist_ok=True)
         with open(f"strategies/step{step}.json", "w") as f:
             json.dump(encoded, f)
     except Exception as e:
         log(f"ERROR: Could not save strategy: {e}", c=red)
-    return [decode_strategy(d) for d in encoded]
+    return [decode_strategy(d, fresh) for d in encoded]
 
 def missing_from(strategy: list[Strategy], props: list[str]) -> list[str]:
     done_props: list[str] = []
@@ -683,27 +676,33 @@ def missing_from(strategy: list[Strategy], props: list[str]) -> list[str]:
         done_props.extend(strategy_step.props)
     return list(set(props).difference(done_props))
 
-async def bmc_mode(props: list[tuple[int, str]], bd: BuildDir):
+async def bmc_mode(root_hash: str,
+                   props: list[tuple[int, str]],
+                   bmc_start: int,
+                   bmc_step: int,
+                   bd: BuildDir):
     if len(props) == 1:
         step, prop = props[0]
         log(f"Doing unbounded BMC for step on {prop} from step {step}", c=white)
-        await bmc(step, [prop], bd, start=args.bmc_start)
+        await bmc(root_hash, step, [prop], bd, start=bmc_start)
         return
 
     if len(props) == 0:
         log("No properties to do BMC on!", c=red)
         return
-    i = args.bmc_start
+    i = bmc_start
     while True:
         for step, prop in props:
             log(f"Doing BMC at depth {i} on {prop} from step {step}", c=white)
-            await bmc(step, [prop], bd, start=i, end=i)
-        i += args.bmc_step
+            await bmc(root_hash, step, [prop], bd, start=i, end=i)
+        i += bmc_step
 
-async def info_mode(by_step: list[list[str]], by_step_skipped: list[list[str]]):
+async def info_mode(by_step: list[list[str]],
+                    by_step_skipped: list[list[str]],
+                    fresh: bool):
     total_steps = 0
     for step, _ in enumerate(by_step):
-        strategy = load_strategy(step)
+        strategy = load_strategy(step, fresh)
         if strategy is None:
             log(f"No proof strategy entry for step {step}", c=orange)
             strategy = []
@@ -722,28 +721,33 @@ async def info_mode(by_step: list[list[str]], by_step_skipped: list[list[str]]):
             log(f"Step {step} :: UNACCOUNTED :: :: :: {' '.join(unaccounted)}", c=red)
     log(f"{total_steps} proof steps in total")
 
-async def prove_mode(all_props: list[tuple[int, str]],
+async def prove_mode(root_hash: str,
+                     all_props: list[tuple[int, str]],
                      by_step: list[list[str]],
+                     fresh: bool,
+                     start: int,
+                     work_by_step: bool,
+                     check_complete: bool,
                      bd: BuildDir):
     all_strategies: list[Strategy] = []
     for step, props in enumerate(by_step):
-        if step < args.start:
+        if step < start:
             log(f"Skipping step {step}", c=orange)
             continue
-        strategy = load_strategy(step)
+        strategy = load_strategy(step, fresh)
         if strategy is None or len(strategy) == 0:
             log(f"No strategy for step {step}, skipping", c=orange)
             continue
 
-        if args.by_step:
+        if work_by_step:
             log(f"Running strategy for step {step} ({len(props)} properties)", c=white)
             run_start = time.time()
-            await run_strategy(strategy, bd)
+            await run_strategy(root_hash, strategy, bd)
             run_dt = time.time() - run_start
             log(f"Ran strategy for step {step} in {run_dt:.3f}s", c=white)
         all_strategies.extend(strategy)
 
-    if args.check_complete:
+    if check_complete:
         covered: set[str] = set()
         for step in all_strategies:
             covered.update(step.props)
@@ -754,10 +758,10 @@ async def prove_mode(all_props: list[tuple[int, str]],
         else:
             log(f"All {len(all_props)} properties are covered.", c=green)
 
-    if not args.by_step:
+    if not work_by_step:
         log(f"Running strategy for everything", c=white)
         run_start = time.time()
-        results = await run_strategy(all_strategies, bd)
+        results = await run_strategy(root_hash, all_strategies, bd)
         run_dt = time.time() - run_start
         log(f"Ran strategy in {run_dt:.3f}s", c=white)
 
@@ -773,8 +777,14 @@ async def prove_mode(all_props: list[tuple[int, str]],
         if has_errors:
             exit(1) # Failed
 
-async def construct_strategy(step: int, props: list[str], bd: BuildDir) -> tuple[bool, list[Strategy], list[str]]:
-    strategy = load_strategy(step) or []
+async def construct_strategy(root_hash: str,
+                             step: int,
+                             props: list[str],
+                             fresh: bool,
+                             no_store: bool,
+                             hard: bool,
+                             bd: BuildDir) -> tuple[bool, list[Strategy], list[str]]:
+    strategy = load_strategy(step, fresh) or []
     not_done = missing_from(strategy, props)
     if len(not_done) == 0:
         return False, strategy, []
@@ -783,44 +793,52 @@ async def construct_strategy(step: int, props: list[str], bd: BuildDir) -> tuple
     build_start = time.time()
 
     failures: list[tuple[int, str]] = []
-    if args.hard:
+    if hard:
         log("strategy: each property", c=white)
-        for x in await asyncio.gather(*[build_strategy_rec(step, [prop], failures, bd, difficult=True) for prop in not_done]):
+        for x in await asyncio.gather(*[build_strategy_rec(root_hash, step, [prop], failures, bd, difficult=True) for prop in not_done]):
             strategy.extend(x)
     else:
         log("strategy: name based recursive splitting, linear fallback", c=white)
         blocks = split_by_prefixes(not_done)
-        strategy += await build_strategy_rec(step, blocks, failures, bd, difficult=args.hard)
+        strategy += await build_strategy_rec(root_hash, step, blocks, failures, bd, difficult=hard)
 
     build_dt = time.time() - build_start
     log(f"Constructed strategy for step {step} of {len(strategy)} proof steps in {build_dt:.3f}s", c=white)
-    strategy = store_strategy(step, strategy)
+    strategy = store_strategy(step, strategy, fresh, no_store)
     return True, strategy, [f[1] for f in failures]
 
-async def explore_mode(by_step: list[list[str]], bd: BuildDir):
+async def explore_mode(root_hash: str,
+                       by_step: list[list[str]],
+                       fresh: bool,
+                       no_store: bool,
+                       start: int,
+                       hard: bool,
+                       no_run: bool,
+                       bd: BuildDir):
     all_failures: list[str] = []
     for step, props in enumerate(by_step):
-        if step < args.start:
+        if step < start:
             log(f"Skipping step {step}", c=orange)
             continue
 
-        new, strategy, failures = await construct_strategy(step, props, bd)
+        new, strategy, failures = await construct_strategy(root_hash, step, props,
+                                                           fresh, no_store, hard, bd)
         all_failures.extend(failures)
         if new:
             log(f"All failures to date: {all_failures}", c=gray)
 
-        if args.no_run:
+        if no_run:
             pass
         elif not new or len(strategy) != 1:
             log(f"Running strategy for step {step} ({len(props)} properties)", c=white)
             run_start = time.time()
-            await run_strategy(strategy, bd)
+            await run_strategy(root_hash, strategy, bd)
             run_dt = time.time() - run_start
             log(f"Ran strategy for step {step} in {run_dt:.3f}s", c=white)
         else:
             log(f"Skipping proof run for step {step}, since it has just one step", c=white)
 
-async def async_main(bd: BuildDir):
+async def async_main(args: argparse.Namespace, root_hash: str, bd: BuildDir):
     global process_runner
 
     def preproc_name(name: str) -> tuple[int, str]:
@@ -841,7 +859,7 @@ async def async_main(bd: BuildDir):
                 by_step.append([])
         return by_step
 
-    process_runner = ProcessRunner()
+    process_runner = ProcessRunner(args)
     process_runner.start_loop()
 
     log("Reading property list", c=white)
@@ -862,7 +880,7 @@ async def async_main(bd: BuildDir):
             exit(1)
     if args.missing:
         for step, sprops in enumerate(by_step):
-            strategy = load_strategy(step)
+            strategy = load_strategy(step, args.fresh)
             if strategy is None:
                 continue
             props.extend([(step, p) for p in missing_from(strategy, sprops)])
@@ -879,14 +897,50 @@ async def async_main(bd: BuildDir):
 
     match args.mode:
         case "bmc":
-            await bmc_mode(props, bd)
+            await bmc_mode(root_hash, props,
+                           args.bmc_start, args.bmc_step, bd)
         case "info":
-            await info_mode(by_step, skipped_by_step)
+            await info_mode(by_step, skipped_by_step, args.fresh)
         case "prove":
-            await prove_mode(props, by_step, bd)
+            await prove_mode(root_hash, props, by_step,
+                             args.fresh, args.start,
+                             args.by_step, args.check_complete, bd)
         case "explore":
-            await explore_mode(by_step, bd)
+            await explore_mode(root_hash, by_step,
+                               args.fresh, args.no_store,
+                               args.start, args.hard, args.no_run, bd)
 
 
 def main():
-    asyncio.run(async_main(bd))
+    parser = argparse.ArgumentParser(prog="conductor.py", description="Constructs and executes proofs.", epilog="Additionally, the PROOFLOG env var sets the prooflog file (i.e. one proof result per line, JSON), and the LOGFILE env var sets the logging file.")
+    parser.add_argument("mode", choices=["prove", "explore", "bmc", "info"],
+                        help="Proof mode. "
+                        "prove will run existing proofs where they exist, "
+                        "explore will attempt to discover new proofs, "
+                        "bmc will do bounded model checking on each property individually, "
+                        "info dumps stats about cached proofs.")
+    parser.add_argument("--build-dir", type=Path, default=Path("build"), help="The directory in which to work")
+    parser.add_argument("--fresh", action="store_true", help="In explore mode, do not use already constructed proofs, always construct new proofs.")
+    parser.add_argument("--no-store", action="store_true", help="In explore mode, do not store constructed proof strategies.")
+    parser.add_argument("--by-step", action="store_true", help="In prove mode, do proofs one step at a time")
+    parser.add_argument("-p", "--properties", nargs="*", default=[], help="Restrict to only the properties with the given names, otherwise all properties. Especially helpful for BMC.")
+    parser.add_argument("--missing", action="store_true", help="Equivalent to -p <each property that is not skipped but has no proof in a step where there are some proofs>")
+    parser.add_argument("-s", "--start", type=int, default=0, help="First step to start at. (default: 0)")
+    parser.add_argument("--bmc-step", type=int, default=1, help="Step size for BMC. (default: 1)")
+    parser.add_argument("--bmc-start", type=int, default=4, help="Start length for BMC. (default: 4)")
+    parser.add_argument("--hard", action="store_true", help="In explore mode, try harder to prove properties (1hr timeout, more engines).")
+    parser.add_argument("--no-run", action="store_true", help="In explore mode don't run proofs again to check steps.")
+    parser.add_argument("--no-kill", action="store_true", help="Don't kill proof processes due to running out of memory.")
+    parser.add_argument("--check-complete", action="store_true", help="In prove mode, fail if there are unskipped properties without proofs.")
+    parser.add_argument("--max-mem", type=float, default=0, help="Max memory in GB, otherwise use all available memory")
+    args = parser.parse_args()
+
+    if len(SKIPPED_PROPS) > 0:
+        log(f"WARNING: Skipped properties are {' '.join(SKIPPED_PROPS)}", c=orange)
+
+    bd = BuildDir(args.build_dir)
+
+    ROOT_HASH = hashlib.new("sha256", bd.filepath(bd.aig).read_bytes()).hexdigest()
+    log(f"{bd.filepath(bd.aig)} has sha256 {ROOT_HASH}")
+
+    asyncio.run(async_main(args, ROOT_HASH, bd))
