@@ -306,7 +306,18 @@ class ProcessRunner:
 
         self.args = args
 
-        log(f"Process runner will have a maximum of {ProcessRunner.MAX_RUNNING} processes, and currently sees {self.mem_avail():.3f}GB free.")
+        # Check that args.max_mem is more than twice as big as
+        # GLOBAL_MEMORY_BUFFER. The latter is meant to be "some extra buffering
+        # space", so it definitely shouldn't be as much as half of the total
+        # space available.
+        if (args.max_mem <= 2 * ProcessRunner.GLOBAL_MEMORY_BUFFER):
+            msg = (f"The allowed RAM is {args.max_mem} GiB, which is not more than twice "
+                   f"the size of the buffer memory "
+                   f"({ProcessRunner.GLOBAL_MEMORY_BUFFER} GiB)")
+            raise RuntimeError(msg)
+
+        log(f"Process runner will have a maximum of {ProcessRunner.MAX_RUNNING} processes, "
+            f"and currently sees {self.mem_avail():.3f}GB free.")
 
     def append(self, proc):
         self.pending.insert(0, proc)
