@@ -840,13 +840,47 @@ async def explore_mode(root_hash: str,
 
 
 def split_step_name(name: str) -> tuple[int, str]:
-    '''Split a step name that should be of the form "Step123_foo" into (123, 'foo')'''
-    m = re.match('Step([0-9]+)_(.*)', name)
+    '''Split a step name out of an assertion name, yielding (idx, 'name').
+
+    The assertion should be of the form "Step123_foo", which will yield the
+    pair (123, 'foo'). However, this expects to be called with a Yosys internal
+    name, which will actually look like "$\tb.Step123_foo$19129".
+
+    '''
+    # Extract the hierarchical path, by stripping away any "$\" prefix and
+    # "$1234" suffix. First, the prefix:
+    if name.startswith('$\\'):
+        name1 = name[2:]
+    else:
+        name1 = name
+
+    # Now any $1234 suffix. Note that we assume there is at least one character
+    # before the suffix (so we won't strip away the whole of something like "$\$123".
+    m = re.match(r'(.+)\$[0-9]+$', name1)
+    if m:
+        name2 = m.group(1)
+    else:
+        name2 = name1
+
+    if not name2:
+        raise ValueError(f"Failed to split step name from {name}: after dropping "
+                         "header and footer, there was nothing left.")
+
+    # At this point, we'll have something like "tb.Step123_foo". Tokenise the
+    # hierarchical name and just take out the bottom part.
+    parts = name2.split('.')
+
+    # The result of the split call will always be nonempty, so will have a last
+    # string.
+    basename = parts[-1]
+
+    m = re.match('Step([0-9]+)_(.*)', basename)
     if not m:
-        msg = (f"Failed to extract step from assertion name {name}. "
-               "We expect the form 'Step123_foo'.")
+        msg = (f"Failed to extract step from assertion name {name}, which demangled "
+               f"to {basename}. We expect the form 'Step123_foo'.")
         raise ValueError(msg)
     return int(m.group(1)), m.group(2)
+
 
 async def async_main(args: argparse.Namespace, root_hash: str, bd: BuildDir):
     global process_runner
