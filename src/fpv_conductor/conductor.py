@@ -863,10 +863,19 @@ async def async_main(args: argparse.Namespace, root_hash: str, bd: BuildDir):
     process_runner.start_loop()
 
     log("Reading property list", c=white)
-    with open(bd.filepath(bd.ywmap)) as f:
-        names = [preproc_name(x[0]) for x in json.load(f)["asserts"]]
-    max_step = max(step for step, _ in names)
-    names = [(step, name) for step, name in names if not name.endswith("_Cover")]
+
+    ywmap_path = bd.filepath(bd.ywmap)
+
+    with open(ywmap_path) as f:
+        asserts = json.load(f).get("asserts")
+    if not asserts:
+        raise ValueError(f"The ywmap at {ywmap_path} has no asserts.")
+
+    preproc_names = [preproc_name(x[0]) for x in asserts]
+
+    max_step = max(step for step, _ in preproc_names)
+    names = [(step, name) for step, name in preproc_names
+             if not name.endswith("_Cover")]
 
     by_step = group_by_step(names)
     props: list[tuple[int, str]] = []
