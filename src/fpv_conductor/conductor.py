@@ -465,9 +465,10 @@ async def prepare_aiger(step: int, props: list[str], log_path: Path, bd: BuildDi
     name = f"aiger-{aiger_idx}.aig"
     aiger_idx += 1
     cmd = bd.aig_manip_select_cmd(bd.filepath(name), step, props)
-    assert (await shell(cmd,
-                        log_path,
-                        exp_memory=0.5)).code == 0
+    retcode = (await shell(cmd, log_path, exp_memory=0.5)).code
+    if retcode != 0:
+        msg = f"Failed to run {cmd}. Return code {retcode} != 0."
+        raise RuntimeError(msg)
 
     return name
 
