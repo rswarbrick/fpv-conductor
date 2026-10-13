@@ -77,6 +77,23 @@ class BuildDir:
         """Return a Path for the given file in this directory."""
         return self.path / basename
 
+    def open(self, rel_path: str, mode: str) -> typing.IO:
+        '''Open a file at rel_path inside the directory
+
+        If mode starts with 'w', 'x' or 'a' (so we might create a file), this
+        ensures the target directory exists.
+
+        Arguments:
+
+          rel_path:    The relative path (inside self.path) for the file to open.
+
+          mode:        The mode passed to the underlying open() call.
+        '''
+        path = self.filepath(rel_path)
+        if mode and (mode[0] in 'wxa'):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        return path.open(mode)
+
     def aig_manip_select_cmd(self,
                              out: Path,
                              step: int,
@@ -183,7 +200,7 @@ class ProcessFuture(asyncio.Future):
         return super().cancel(msg=msg)
 
 '''
-Information regarding the completion of a process, including memory/time and stdio. 
+Information regarding the completion of a process, including memory/time and stdio.
 '''
 class ProcessResult:
     def __init__(self, code, reason, max_mem, dt, stdout, stderr):
@@ -209,7 +226,13 @@ Handles the tracking of time and timeouts, and of memory consumption.
 debug_slow allows for periodic logging.
 '''
 class Process:
-    def __init__(self, cmd, expected_memory = 0.0, expected_time = 0.0, timeout = None, debug_slow = None):
+    def __init__(self,
+                 cmd,
+                 expected_memory = 0.0,
+                 expected_time = 0.0,
+                 timeout = None,
+                 debug_slow = None,
+                 log_path: Path | None = None):
         self.cmd: str = cmd
         self.expected_memory: float = expected_memory
         self.expected_time: float = expected_time
@@ -219,6 +242,7 @@ class Process:
         self.debug_slow = debug_slow # A message to write when the process is taking a long time
         self.debug_slow_count = 0
 
+        self.log_path : Path | None = log_path
         self.proc = None # Will be set on start()
         self.psproc = None
 
@@ -299,8 +323,8 @@ class ProcessRunner:
     MAX_RUNNING = (psutil.cpu_count() or 8) - 2 # Number of CPUs, with a couple spares
 
     def __init__(self, args):
-        self.pending = []
-        self.running = []
+        self.pending: list[tuple[Process, Path | None]] = []
+        self.running: list[tuple[Process, tuple[Path, typing.IO] | None]] = []
         self.first_start = time.time()
         self.debug_count = 0
 
@@ -319,14 +343,15 @@ class ProcessRunner:
         log(f"Process runner will have a maximum of {ProcessRunner.MAX_RUNNING} processes, "
             f"and currently sees {self.mem_avail():.3f}GB free.")
 
-    def append(self, proc):
-        self.pending.insert(0, proc)
+    def enqueue(self, proc: Process, out_file: Path | None):
+        '''Enqueue a process that should be run'''
+        self.pending.insert(0, (proc, out_file))
 
     def start_loop(self):
         asyncio.get_running_loop().call_soon(lambda: self.poll())
 
     def children_used_mem(self):
-        return sum(proc.max_memory for proc in self.running)
+        return sum(proc.max_memory for proc, _ in self.running)
 
     def mem_avail(self):
         if self.args.max_mem == 0:
@@ -337,24 +362,44 @@ class ProcessRunner:
         # Kill recently started processes until memory is OK, unless there is just one, then there's no point(?)
         free = self.mem_avail()
         while not self.args.no_kill and free < ProcessRunner.GLOBAL_MEMORY_BUFFER and len(self.running) > 1:
-            last = self.running.pop()
+            last, last_path_file = self.running.pop()
             last.kill_restart()
+
+            last_path: Path | None = None
+            if last_path_file is not None:
+                last_path = last_path_file[0]
+                last_path_file[1].close()
+
             free += max(last.max_memory, 3)
             last.poll()
-            self.pending.append(last)
+            self.pending.append((last, last_path))
 
-        while len(self.running) < ProcessRunner.MAX_RUNNING and len(self.pending) > 0 and free > self.pending[-1].expected_memory + ProcessRunner.GLOBAL_MEMORY_BUFFER:
+        while self.pending and (len(self.running) < ProcessRunner.MAX_RUNNING):
+            next_job, next_log_path = self.pending[-1]
+            if (next_job.expected_memory > free - ProcessRunner.GLOBAL_MEMORY_BUFFER):
+                # There's not space for the next job
+                break
+
             if self.first_start == 0:
                 self.first_start = time.time()
-            last = self.pending.pop()
-            last.start()
-            free -= max(last.expected_memory, 3) # otherwise lots of zeros won't help
-            self.running.append(last)
+
+            # Pop the (next_job, next_log_path) pair from self.pending: we're
+            # going to start running the job.
+            self.pending.pop()
+
+            if next_log_path is not None:
+                next_log_pair = (next_log_path, open(next_log_path, 'w'))
+            else:
+                next_log_pair = None
+
+            next_job.start()
+            free -= max(next_job.expected_memory, 3) # otherwise lots of zeros won't help
+            self.running.append((next_job, next_log_pair))
 
         # Drop processes that finished
         p = 0
         while p < len(self.running):
-            if self.running[p].poll():
+            if self.running[p][0].poll():
                 self.running.pop(p)
             else:
                 p += 1
@@ -367,28 +412,62 @@ class ProcessRunner:
         asyncio.get_running_loop().call_later(ProcessRunner.POLL_DELAY, lambda: self.poll())
 
 process_runner: ProcessRunner | None = None
-'''Run a shell command in the global process runner'''
-async def shell(cmd, expected_memory = 0.0, timeout = None, debug_slow = None):
+
+async def shell(cmd: str,
+                log_path: Path | None,
+                exp_memory: float = 0.0,
+                timeout = None,
+                debug_slow = None):
+    '''Run a shell command in the global process runner
+
+    Arguments:
+
+      cmd:        The command to be run (as a string)
+
+      log_path:   The path where the output of the command will be written, or
+                  None if the output should be discarded.
+
+      exp_memory: The amount of memory (in GiB) that the command is
+                  expected to use.
+
+      timeout:    If not None, a time-out in seconds.
+
+      debug_slow: If not None, a "still alive" message that should be written
+                  periodically to show that the process is still running.
+
+    '''
     assert process_runner is not None
-    proc = Process(cmd, expected_memory=expected_memory, timeout=timeout, debug_slow=debug_slow)
-    process_runner.append(proc)
+    proc = Process(cmd, expected_memory=exp_memory,
+                   timeout=timeout, debug_slow=debug_slow,
+                   log_path=log_path)
+    process_runner.enqueue(proc, log_path)
     return await proc.future
 
 # ------------------------ Proof Primitives ------------------
 
-'''
-Prepares an aiger file configured for the properties at the given step specifically, return a run unique path to it
-'''
 aiger_idx = 0
-async def prepare_aiger(step: int, props: list[str], bd: BuildDir) -> str:
+async def prepare_aiger(step: int, props: list[str], log_path: Path, bd: BuildDir) -> str:
+    '''Make an aiger file for the properties at the given step.
+
+    Returns the (base) name of that file.
+
+    Arguments:
+
+      step:  The index of the step that is being run.
+
+      props: A list of the properties that will be run in this step.
+
+      bd:    The directory in which the build is running.
+
+    '''
     global aiger_idx
 
     name = f"aiger-{aiger_idx}.aig"
     aiger_idx += 1
-    assert (await shell(bd.aig_manip_select_cmd(bd.filepath(name),
-                                                step,
-                                                props),
-                        expected_memory=0.5)).code == 0
+    cmd = bd.aig_manip_select_cmd(bd.filepath(name), step, props)
+    assert (await shell(cmd,
+                        log_path,
+                        exp_memory=0.5)).code == 0
 
     return name
 
@@ -434,94 +513,247 @@ def proof_done(engine_config: str,
         case n:
             log(f"Unknown Exit Code {n}: Failed to prove {len(props)} properties in step {step} ({procres.dt:.3f}s with {procres.max_mem:.3f}GB)", c=red)
 
-'''Prove some properties with the given config'''
 async def prove(engine_config: str,
                 root_hash: str,
                 step: int,
                 props: list[str],
+                rel_log_path_root: str,
                 bd: BuildDir,
                 timeout=None,
                 expected_memory=10.0) -> ProcessResult:
-    specialised = await prepare_aiger(step, props, bd)
-    res = await shell(f"{engine_config} {specialised}", timeout=timeout, expected_memory=expected_memory)
+    '''Prove some properties with the given config
+
+    Arguments:
+
+      engine_config:     The config to use.
+
+      root_hash:         The hash of the root AIG file.
+
+      step:              The index of the current step.
+
+      props:             The properties that need proving.
+
+      rel_log_path_root: The root of a relative path where log files should be
+                         produced. If this is resolved inside bd to the path P
+                         then the aiger extraction step will write a log to
+                         P.prep.log and the proof step itself will write to
+                         P.prove.<engine_config>.log.
+
+      bd:                The build directory to use.
+
+      timeout:           If nonzero, a timeout for the prove step in seconds.
+
+      expected_memory:   The amount of memory (in GiB) expected by the proof step.
+
+    '''
+    log_path_root = bd.filepath(rel_log_path_root)
+    prove_suffix = '.prove.' + engine_config + '.log'
+    prep_log_path = log_path_root.with_name(log_path_root.name + '.prep.log')
+    prove_log_path = log_path_root.with_name(log_path_root.name + prove_suffix)
+
+    specialised = await prepare_aiger(step, props, prep_log_path, bd)
+    res = await shell(f"{engine_config} {specialised}",
+                      prove_log_path,
+                      timeout=timeout,
+                      exp_memory=expected_memory)
     proof_done(engine_config, root_hash, specialised, step, props, res)
     return res
 
 cex_id = 0
-'''Run Bounded Model Checking on some properties'''
 async def bmc(root_hash: str,
               step: int,
               props: list[str],
+              rel_log_path_root: str,
               bd: BuildDir,
               timeout=None,
               start=None,
               end=None) -> ProcessResult:
+    '''Run Bounded Model Checking on some properties
+
+    Arguments:
+
+      root_hash:         The hash of the root AIG file.
+
+      step:              The index of the current step.
+
+      props:             The properties that need proving.
+
+      rel_log_path_root: The root of a relative path where log files should be
+                         produced. This will be passed to prove() while that is
+                         trying to create an SST counterexample. Assuming the
+                         prove step does manage to produce a counterexample,
+                         aig_manip will run to create a witness VCD trace that
+                         shows the counterxample. If rel_log_path_root is
+                         reloved inside bd to the path P then this second step
+                         will write to P.sim.log.
+
+      bd:                The build directory to use.
+
+      timeout:           If not None, a timeout for the prove step in seconds.
+
+      start:             Start argument given to rIC3 for search.
+
+      end:               End argument given to rIC3 for search.
+
+    '''
+
     global cex_id
 
     engine_cfg = ("rIC3 -e bmc --no-preproc --witness" +
                   ("" if start is None else f" --start {start}") +
                   ("" if end is None else f" --end {end}"))
 
-    res = await prove(engine_cfg, root_hash, step, props, bd, timeout=timeout)
+    res = await prove(engine_cfg, root_hash,
+                      step, props,
+                      rel_log_path_root, bd, timeout=timeout)
     if res.code == 10:
         assert res.stdout is not None
         own_id = cex_id
         cex_id += 1
         witness = res.stdout.split("\n", maxsplit=1)[1]
+
+        log_path_root = bd.filepath(rel_log_path_root)
+        sim_log_path = log_path_root.with_name(log_path_root.name + '.sim.log')
+
         Path(f"witness-{own_id}.aiw").write_text(witness)
         log(f"Written trace to witness-{own_id}.aiw", c=white)
         await shell(bd.aig_manip_sim_cmd(f"witness-{own_id}.aiw",
-                                         f"trace-{own_id}.vcd"))
+                                         f"trace-{own_id}.vcd"),
+                    sim_log_path)
         log(f"Produced VCD file at trace-{own_id}.vcd", c=white)
     return res
 
 # -------------------------- Proof Exploration -----------------------
 
-'''Try several configurations for some properties and see which is best, if any'''
 async def explore(root_hash: str,
                   step: int,
                   props: list[str],
+                  rel_log_path_root: str,
                   configs: list[tuple[str, float]],
                   bd: BuildDir,
                   timeout=0.0,
                   debug_slow=None) -> None | tuple[str, ProcessResult]:
-    specialised = await prepare_aiger(step, props, bd)
+    '''Try several configurations for some properties and see which is best, if any
+
+    Arguments:
+
+      root_hash:         The hash of the root AIG file.
+
+      step:              The index of the current step.
+
+      props:             The properties that need proving.
+
+      rel_log_path_root: The root of a relative path where log files should be
+                         produced. Suppose rel_log_path_root is reloved inside
+                         bd to the path P. Then the prepare_aiger step will
+                         write a log to P.explore.prep.log. The exploration
+                         steps (one per config) will write a log to
+                         P.explore.<config_name>.log.
+
+      bd:                The build directory to use.
+
+      timeout:           If not None, a timeout for the prove step in seconds.
+
+      start:             Start argument given to rIC3 for search.
+
+      end:               End argument given to rIC3 for search.
+
+    '''
+
+    log_path_root = bd.filepath(rel_log_path_root)
+    prep_suffix = '.explore.prep.log'
+    prep_log_path = log_path_root.with_name(log_path_root.name + prep_suffix)
+
+    specialised = await prepare_aiger(step, props, prep_log_path, bd)
 
     async def explore_one(engine_config, expected_memory):
-        result = await shell(f"{engine_config} {specialised}", timeout=timeout, expected_memory=expected_memory, debug_slow=debug_slow)
+        cfg_name = engine_config[0]
+        exp_suffix = '.explore.' + cfg_name + '.log'
+        exp_log_path = log_path_root.with_name(log_path_root.name + exp_suffix)
+
+        result = await shell(f"{engine_config} {specialised}",
+                             exp_log_path,
+                             timeout=timeout,
+                             exp_memory=expected_memory,
+                             debug_slow=debug_slow)
+
         proof_done(engine_config, root_hash, specialised, step, props, result)
         if result.code in {10, 20}:
             return engine_config, result
 
     return await race([explore_one(config, mem) for config, mem in configs])
 
-'''
-Represents a complete proof step for some properties
-'''
+@dataclass
+class PropTree:
+    '''A rose tree for property names (represented by strings).'''
+    children : list['PropTree | str']
+
+    @staticmethod
+    def mk_flat_tree(items: list[str]):
+        return PropTree(list(items))
+
+    @staticmethod
+    def mk_singleton(prop: str):
+        return PropTree([prop])
+
+    def breadth_first(self) -> list[str]:
+        '''Return all the string nodes in the tree'''
+        props = []
+        for child in self.children:
+            if isinstance(child, PropTree):
+                props += child.breadth_first()
+            else:
+                props.append(child)
+        return props
+
 class Strategy:
+    '''A complete proof step for some properties'''
     def __init__(self, step, props, config, procres):
         self.step: int = step
         self.props: list[str] = props
         self.config: str = config
         self.procres: ProcessResult = procres
 
-'''Build a strategy for the given tree, where in each case we either split into subtrees, or prove as a block. A strategy is a flat list of proof instructions.'''
 async def build_strategy_rec(root_hash: str,
                              step: int,
-                             prop_tree: list,
+                             prop_tree: PropTree,
                              failures: list[tuple[int, str]],
+                             rel_log_path_root: str,
                              bd: BuildDir,
-                             eager=False,
                              difficult=False) -> list[Strategy]:
+    '''Build a strategy for the given tree.
 
-    def find_all(prop_tree, all_props):
-        for prop in prop_tree:
-            if type(prop) == str:
-                all_props.append(prop)
-            else:
-                find_all(prop, all_props)
-    all_props = []
-    find_all(prop_tree, all_props)
+    In each case in the tree, we either split into subtrees, or prove as a
+    block. A strategy is a flat list of proof instructions.
+
+    Arguments:
+
+      root_hash:         The hash of the root AIG file.
+
+      step:              The index of the current step.
+
+      prop_tree:         The properties that need proving (as a rose tree)
+
+      failures:          A list to which the function will write information
+                         about failures. A failure is represented as a pair of
+                         the form (n, desc), where n is a step index and desc
+                         describes what didn't work.
+
+      rel_log_path_root: The root of a relative path where log files should be
+                         produced. This will be passed to child functions.
+
+      bd:                The build directory to use.
+
+      difficult:         A flag showing that this is expected to be hard, so
+                         should get extra time.
+
+    '''
+
+    all_props = prop_tree.breadth_first()
+
+    if len(all_props) == 0:
+        return []
+
     # These may be helpful to change depending on the nature of the task
     if difficult:
         ENGINES = [
@@ -538,14 +770,12 @@ async def build_strategy_rec(root_hash: str,
             # ("rIC3 -e kind", 10)
         ]
 
-    if len(all_props) == 0:
-        return []
-
     if len(all_props) == 1:
         while True:
             res = await explore(root_hash,
                                 step,
                                 all_props,
+                                rel_log_path_root,
                                 configs=ENGINES,
                                 bd=bd,
                                 timeout=1800.0 if difficult else 600.0,
@@ -561,11 +791,19 @@ async def build_strategy_rec(root_hash: str,
             failures.append((step, all_props[0]))
             return []
 
-    if len(prop_tree) == 1:
-        return await build_strategy_rec(root_hash, step, prop_tree[0], failures, bd, difficult=difficult)
+    # If PropTree only has one child, we know that child is a genuine PropTree
+    # (because otherwise len(all_props) would have been 0 or 1 and we would
+    # already have returned). Recurse immediately.
+    if len(prop_tree.children) == 1:
+        the_child = prop_tree.children[0]
+        assert isinstance(the_child, PropTree)
+        return await build_strategy_rec(root_hash, step,
+                                        the_child, failures,
+                                        rel_log_path_root, bd, difficult)
 
     async def without_split():
-        res = await explore(root_hash, step, all_props, configs=ENGINES, bd=bd, timeout=120.0)
+        res = await explore(root_hash, step, all_props,
+                            rel_log_path_root, configs=ENGINES, bd=bd, timeout=120.0)
         if res is not None:
             if res[1].code == 20:
                 log(f"Constructed proof for {len(all_props)} properties in step {step}: {' '.join(all_props)}", c=green)
@@ -574,26 +812,40 @@ async def build_strategy_rec(root_hash: str,
                 log(f"Failed to construct proof for {len(all_props)} properties in step {step}: {' '.join(all_props)}", c=red)
 
     async def with_split():
-        children = []
-        rest = []
-        for prop in prop_tree:
-            if type(prop) == str:
+        sub_trees: list[PropTree] = []
+        rest: list[str] = []
+        for prop in prop_tree.children:
+            if isinstance(prop, str):
                 rest.append(prop)
             else:
-                children.append(prop)
+                sub_trees.append(prop)
 
-        if not eager:
-            await asyncio.sleep(120.0) # Give the rest a head start
-        else:
-            await asyncio.sleep(20.0) # Give the rest a tiny head start anyway
+        await asyncio.sleep(120.0) # Give the rest a head start
 
-        if len(children) == 0:
-            solutions = await asyncio.gather(*[build_strategy_rec(root_hash, step, [child], failures,
-                                                                  bd, difficult=difficult) for child in rest])
+        if len(sub_trees) == 0:
+            # If the tree only has string children, enqueue all of them in
+            # parallel. Do this by calling build_strategy_rec again with "one
+            # prop trees". Each instance will then immediately call explore().
+            solutions = await asyncio.gather(
+                *[build_strategy_rec(root_hash, step,
+                                     PropTree.mk_singleton(child),
+                                     failures,
+                                     rel_log_path_root,
+                                     bd, difficult=difficult)
+                  for child in rest]
+            )
         else:
-            children.append(rest)
-            solutions = await asyncio.gather(*[build_strategy_rec(root_hash, step, tree, failures,
-                                                                  bd, difficult=difficult) for tree in children])
+            # Create a list of PropTree objects that starts with the genuine
+            # sub-trees and is followed by a list of single-item trees.
+            strings_last = sub_trees + [PropTree.mk_singleton(r) for r in rest]
+            solutions = await asyncio.gather(
+                *[build_strategy_rec(root_hash, step,
+                                     tree,
+                                     failures,
+                                     rel_log_path_root,
+                                     bd, difficult=difficult)
+                  for tree in strings_last]
+            )
         flattened = []
         for solution in solutions:
             flattened.extend(solution)
@@ -603,34 +855,71 @@ async def build_strategy_rec(root_hash: str,
     assert winner is not None # someone has to win!
     return winner
 
-'''Execute a given strategy, return all the (result, strategy)'''
-async def run_strategy(root_hash: str, strategy: list[Strategy], bd: BuildDir) -> list[tuple[ProcessResult, Strategy]]:
+async def run_strategy(root_hash: str,
+                       strategies: list[Strategy],
+                       rel_log_path_root: str,
+                       bd: BuildDir) -> list[tuple[ProcessResult, Strategy]]:
+    '''Execute a given strategy, return all the (result, strategy)
+
+    Arguments:
+
+      root_hash:         The hash of the root AIG file.
+
+      strategies:        The list of strategies to run.
+
+      rel_log_path_root: The root of a relative path where log files should be
+                         produced. This will be passed to child functions.
+
+      bd:                The build directory to use.
+
+    '''
     proofs = []
-    strategy.sort(key=lambda x: x.procres.dt, reverse=True)
-    for step in strategy:
+    strategies.sort(key=lambda x: x.procres.dt, reverse=True)
+    for step in strategies:
         conf = step.config
         if step.procres.stderr is not None:
             if " -e kind " in step.config:
                 s = step.procres.stderr.split("[INFO ] k-induction proofed in depth ")
                 if len(s) == 2:
                     conf += f" --start {int(s[1].strip())}"
-        proofs.append(prove(conf, root_hash, step.step, step.props, bd,
+        proofs.append(prove(conf, root_hash, step.step, step.props, rel_log_path_root, bd,
                             expected_memory=step.procres.max_mem * 1.1))
-    return list(zip(await asyncio.gather(*proofs), strategy))
+    return list(zip(await asyncio.gather(*proofs), strategies))
 
-'''Construct a proof tree by recursively splitting on the prefix of a name, for example a_x, a_y, b will produce [[a_x, a_y], b]'''
-def split_by_prefixes(names: list[str]) -> list:
-    def chunk_name(name):
-        nts = lambda x: "" if x is None else x
-        split = re.split(r"_([A-Z])|_|([A-Z])", name)
-        return ([split[0]] if split[0] != "" else []) + [nts(split[i + 1]) + nts(split[i + 2]) + split[i + 3] for i in range(0, len(split) - 1, 3)]
+def chunk_name(name: str) -> list[str]:
+    '''Split a name into chunks, delimited by _ and capitals
 
-    def group(props):
-        buckets = {}
-        done = []
+    '''
+    # Using a capture group with re.split means that the contents of every match
+    # will appear in the split list too. For example, re.split("(_)", "a_b")
+    # gives ['a', '_', 'b']. If the regex matches at the first character, the
+    # result is prefixed by a ''.
+    #
+    # Because the regex has multiple branches (with |) the possible matches get
+    # appended. So re.split(r"_([A-Z])|_|([A-Z])", 'abc_def_Ghi') gives the list
+    # ['abc', None, None, 'def', 'G', None, 'hi']. Here, the 'abc' is a "prefix"
+    # before the first match. Then there is a list whose length is a multiple of
+    # three: the two possible capture groups, and then the item afterwards. If
+    # name ends with a match for the regex, the list will have a final '' value.
+    all_split = re.split(r"_([A-Z])|_|([A-Z])", name)
+    parts: list[str] = [all_split[0]] if all_split[0] else []
+    for i in range(1, len(all_split), 3):
+        parts.append((all_split[i] or "") +
+                     (all_split[i + 1] or "") +
+                     (all_split[i + 2] or ""))
+    return parts
+
+def split_by_prefixes(names: list[str]) -> PropTree:
+    '''Construct a proof tree by recursively splitting on the prefix of a name
+
+    For example a_x, a_y, b will produce [[a_x, a_y], b]
+    '''
+    def group(props: list[tuple[list[str], str]]) -> PropTree:
+        buckets: dict[str, list[tuple[list[str], str]]] = {}
+        done = PropTree([])
         for chunks, name in props:
             if len(chunks) == 1:
-                done.append(name)
+                done.children.append(PropTree.mk_singleton(name))
             elif chunks[0] not in buckets:
                 buckets[chunks[0]] = [(chunks[1:], name)]
             else:
@@ -639,8 +928,10 @@ def split_by_prefixes(names: list[str]) -> list:
             bucket = group(buckets[pre])
             # while len(bucket) == 1:
             #     bucket = bucket[0]
-            done.append(bucket)
+            done.children.append(bucket)
         return done
+
+    # chunk_name()
 
     chunked_names = [(chunk_name(name), name) for name in names]
     return group(chunked_names)
@@ -692,10 +983,24 @@ async def bmc_mode(root_hash: str,
                    bmc_start: int,
                    bmc_step: int,
                    bd: BuildDir):
+    '''Run BMC on the given list of properties.
+
+    Arguments:
+
+      root_hash:         The hash of the root AIG file.
+
+      props:             A list of (step, prop) pairs.
+
+      start:             Start argument given to rIC3 for search.
+
+      end:               End argument given to rIC3 for search.
+
+      bd:                The build directory to use.
+    '''
     if len(props) == 1:
         step, prop = props[0]
         log(f"Doing unbounded BMC for step on {prop} from step {step}", c=white)
-        await bmc(root_hash, step, [prop], bd, start=bmc_start)
+        await bmc(root_hash, step, [prop], "bmc.single", bd, start=bmc_start)
         return
 
     if len(props) == 0:
@@ -705,7 +1010,8 @@ async def bmc_mode(root_hash: str,
     while True:
         for step, prop in props:
             log(f"Doing BMC at depth {i} on {prop} from step {step}", c=white)
-            await bmc(root_hash, step, [prop], bd, start=i, end=i)
+            await bmc(root_hash, step, [prop],
+                      f"bmc.step{step}", bd, start=i, end=i)
         i += bmc_step
 
 async def info_mode(by_step: list[list[str]],
@@ -740,6 +1046,31 @@ async def prove_mode(root_hash: str,
                      work_by_step: bool,
                      check_complete: bool,
                      bd: BuildDir):
+    '''Top-level function for proving a set of properties
+
+    Arguments:
+
+      root_hash:         The hash of the root AIG file.
+
+      all_props:         A list of (step, property) pairs.
+
+      by_step:           The same set of properties, but grouped by step (and
+                         cut off at max_step).
+
+      fresh:             Start again (rather than re-using existing runs)
+
+      start:             Start argument given to rIC3 for search.
+
+      work_by_step:      Run the steps serially, completing a step before
+                         starting properties in the next step.
+
+      check_complete:    Check that all properties have been proven (across
+                         all steps).
+
+      bd:                The build directory to use.
+
+    '''
+
     all_strategies: list[Strategy] = []
     for step, props in enumerate(by_step):
         if step < start:
@@ -753,7 +1084,8 @@ async def prove_mode(root_hash: str,
         if work_by_step:
             log(f"Running strategy for step {step} ({len(props)} properties)", c=white)
             run_start = time.time()
-            await run_strategy(root_hash, strategy, bd)
+            await run_strategy(root_hash, strategy,
+                               f"prove.step{step}", bd)
             run_dt = time.time() - run_start
             log(f"Ran strategy for step {step} in {run_dt:.3f}s", c=white)
         all_strategies.extend(strategy)
@@ -772,7 +1104,8 @@ async def prove_mode(root_hash: str,
     if not work_by_step:
         log(f"Running strategy for everything", c=white)
         run_start = time.time()
-        results = await run_strategy(root_hash, all_strategies, bd)
+        results = await run_strategy(root_hash, all_strategies,
+                                     "prove.all", bd)
         run_dt = time.time() - run_start
         log(f"Ran strategy in {run_dt:.3f}s", c=white)
 
@@ -794,6 +1127,7 @@ async def construct_strategy(root_hash: str,
                              fresh: bool,
                              no_store: bool,
                              hard: bool,
+                             rel_log_path_root: str,
                              bd: BuildDir) -> tuple[bool, list[Strategy], list[str]]:
     strategy = load_strategy(step, fresh) or []
     not_done = missing_from(strategy, props)
@@ -806,12 +1140,23 @@ async def construct_strategy(root_hash: str,
     failures: list[tuple[int, str]] = []
     if hard:
         log("strategy: each property", c=white)
-        for x in await asyncio.gather(*[build_strategy_rec(root_hash, step, [prop], failures, bd, difficult=True) for prop in not_done]):
+        strategies = \
+            await asyncio.gather(*[build_strategy_rec(root_hash,
+                                                      step,
+                                                      PropTree.mk_singleton(prop),
+                                                      failures,
+                                                      rel_log_path_root,
+                                                      bd, difficult=True)
+                                   for prop in not_done])
+
+        for x in strategies:
             strategy.extend(x)
     else:
         log("strategy: name based recursive splitting, linear fallback", c=white)
         blocks = split_by_prefixes(not_done)
-        strategy += await build_strategy_rec(root_hash, step, blocks, failures, bd, difficult=hard)
+        strategy += await build_strategy_rec(root_hash,
+                                             step, blocks, failures,
+                                             rel_log_path_root, bd, difficult=hard)
 
     build_dt = time.time() - build_start
     log(f"Constructed strategy for step {step} of {len(strategy)} proof steps in {build_dt:.3f}s", c=white)
@@ -832,8 +1177,10 @@ async def explore_mode(root_hash: str,
             log(f"Skipping step {step}", c=orange)
             continue
 
-        new, strategy, failures = await construct_strategy(root_hash, step, props,
-                                                           fresh, no_store, hard, bd)
+        new, strategy, failures = \
+            await construct_strategy(root_hash, step, props,
+                                     fresh, no_store, hard,
+                                     "explore.strategy", bd)
         all_failures.extend(failures)
         if new:
             log(f"All failures to date: {all_failures}", c=gray)
@@ -843,7 +1190,7 @@ async def explore_mode(root_hash: str,
         elif not new or len(strategy) != 1:
             log(f"Running strategy for step {step} ({len(props)} properties)", c=white)
             run_start = time.time()
-            await run_strategy(root_hash, strategy, bd)
+            await run_strategy(root_hash, strategy, "explore.run", bd)
             run_dt = time.time() - run_start
             log(f"Ran strategy for step {step} in {run_dt:.3f}s", c=white)
         else:
