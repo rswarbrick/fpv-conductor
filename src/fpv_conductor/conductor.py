@@ -472,8 +472,21 @@ async def prepare_aiger(step: int, props: list[str], log_path: Path, bd: BuildDi
 
     return name
 
+@dataclass
+class Config:
+    '''An engine configuration'''
+    raw: str
+    """The description of the config to pass to the engine"""
+
+    desc: str
+    """Short description of config (used for log file names)"""
+
+    def custom_version(self, raw_suff: str, desc_suff: str):
+        return Config(f"{self.raw} {raw_suff}", f"{self.desc}.{desc_suff}")
+
+
 '''Log a nice message on proof completion, and store in the proof log'''
-def proof_done(engine_config: str,
+def proof_done(engine_config: Config,
                root_hash: str,
                path: str,
                step: int,
@@ -481,7 +494,7 @@ def proof_done(engine_config: str,
                procres: ProcessResult):
     if not "NO_LOG" in os.environ:
         with open(PROOFLOG, "a") as f:
-            json.dump([time.time(), [props, step, root_hash, engine_config], vars(procres)], f)
+            json.dump([time.time(), [props, step, root_hash, engine_config.raw], vars(procres)], f)
             f.write("\n")
     match procres.code:
         case 20:
@@ -496,7 +509,7 @@ def proof_done(engine_config: str,
             log(f"==========================================================================================================================", c=red)
             log(f"One of these properties in step {step} is not valid: {' '.join(props)}", c=red)
             log(f"To recover a witness run the following:")
-            log(f"    {engine_config} {path} --witness | tail -n +2 > witness.aiw")
+            log(f"    {engine_config.raw} {path} --witness | tail -n +2 > witness.aiw")
             log(f"Or the following:")
             log(f"    rIC3 -e bmc --no-preproc {path} --witness | tail -n +2 > witness.aiw")
             log(f"Or, to compare against another engine:")
@@ -514,7 +527,7 @@ def proof_done(engine_config: str,
         case n:
             log(f"Unknown Exit Code {n}: Failed to prove {len(props)} properties in step {step} ({procres.dt:.3f}s with {procres.max_mem:.3f}GB)", c=red)
 
-async def prove(engine_config: str,
+async def prove(config: Config,
                 root_hash: str,
                 step: int,
                 props: list[str],
@@ -548,16 +561,16 @@ async def prove(engine_config: str,
 
     '''
     log_path_root = bd.filepath(rel_log_path_root)
-    prove_suffix = '.prove.' + engine_config + '.log'
+    prove_suffix = '.prove.' + config.desc + '.log'
     prep_log_path = log_path_root.with_name(log_path_root.name + '.prep.log')
     prove_log_path = log_path_root.with_name(log_path_root.name + prove_suffix)
 
     specialised = await prepare_aiger(step, props, prep_log_path, bd)
-    res = await shell(f"{engine_config} {specialised}",
+    res = await shell(f"{config.raw} {specialised}",
                       prove_log_path,
                       timeout=timeout,
                       exp_memory=expected_memory)
-    proof_done(engine_config, root_hash, specialised, step, props, res)
+    proof_done(config, root_hash, specialised, step, props, res)
     return res
 
 cex_id = 0
@@ -600,12 +613,12 @@ async def bmc(root_hash: str,
 
     global cex_id
 
-    engine_cfg = ("rIC3 -e bmc --no-preproc --witness" +
-                  ("" if start is None else f" --start {start}") +
-                  ("" if end is None else f" --end {end}"))
+    raw_cfg = ("rIC3 -e bmc --no-preproc --witness" +
+               ("" if start is None else f" --start {start}") +
+               ("" if end is None else f" --end {end}"))
+    cfg = Config(raw_cfg, "bmc")
 
-    res = await prove(engine_cfg, root_hash,
-                      step, props,
+    res = await prove(cfg, root_hash, step, props,
                       rel_log_path_root, bd, timeout=timeout)
     if res.code == 10:
         assert res.stdout is not None
@@ -630,10 +643,10 @@ async def explore(root_hash: str,
                   step: int,
                   props: list[str],
                   rel_log_path_root: str,
-                  configs: list[tuple[str, float]],
+                  configs: list[tuple[Config, float]],
                   bd: BuildDir,
                   timeout=0.0,
-                  debug_slow=None) -> None | tuple[str, ProcessResult]:
+                  debug_slow=None) -> None | tuple[Config, ProcessResult]:
     '''Try several configurations for some properties and see which is best, if any
 
     Arguments:
@@ -667,20 +680,20 @@ async def explore(root_hash: str,
 
     specialised = await prepare_aiger(step, props, prep_log_path, bd)
 
-    async def explore_one(engine_config, expected_memory):
-        cfg_name = engine_config[0]
-        exp_suffix = '.explore.' + cfg_name + '.log'
+    async def explore_one(cfg: Config,
+                          expected_memory: float) -> tuple[Config, ProcessResult] | None:
+        exp_suffix = '.explore.' + cfg.desc + '.log'
         exp_log_path = log_path_root.with_name(log_path_root.name + exp_suffix)
 
-        result = await shell(f"{engine_config} {specialised}",
+        result = await shell(f"{cfg.raw} {specialised}",
                              exp_log_path,
                              timeout=timeout,
                              exp_memory=expected_memory,
                              debug_slow=debug_slow)
 
-        proof_done(engine_config, root_hash, specialised, step, props, result)
+        proof_done(cfg, root_hash, specialised, step, props, result)
         if result.code in {10, 20}:
-            return engine_config, result
+            return cfg, result
 
     return await race([explore_one(config, mem) for config, mem in configs])
 
@@ -707,13 +720,20 @@ class PropTree:
                 props.append(child)
         return props
 
+@dataclass
 class Strategy:
     '''A complete proof step for some properties'''
-    def __init__(self, step, props, config, procres):
-        self.step: int = step
-        self.props: list[str] = props
-        self.config: str = config
-        self.procres: ProcessResult = procres
+    step: int
+    """Step index in proof structure"""
+
+    props: list[str]
+    """Properties to prove"""
+
+    config: Config
+    """Engine configuration"""
+
+    procres: ProcessResult
+    """Result of the process that was run."""
 
 async def build_strategy_rec(root_hash: str,
                              step: int,
@@ -756,18 +776,20 @@ async def build_strategy_rec(root_hash: str,
         return []
 
     # These may be helpful to change depending on the nature of the task
+    ENGINES: list[tuple[Config, float]] = []
+
     if difficult:
         ENGINES = [
             # ("rIC3", 10),
             # ("rIC3 --no-preproc", 20),
-            ("rIC3 -e kind --no-preproc", 10.0),
+            (Config("rIC3 -e kind --no-preproc", "npp"), 10.0),
             # ("rIC3 -e kind", 10)
         ]
     else:
         ENGINES = [
-            ("rIC3", 10),
+            (Config("rIC3", "std"), 10),
             # ("rIC3 --no-preproc", 20),
-            ("rIC3 -e kind --no-preproc", 10.0),
+            (Config("rIC3 -e kind --no-preproc", "npp"), 10.0),
             # ("rIC3 -e kind", 10)
         ]
 
@@ -879,10 +901,13 @@ async def run_strategy(root_hash: str,
     for step in strategies:
         conf = step.config
         if step.procres.stderr is not None:
-            if " -e kind " in step.config:
+            if " -e kind " in step.config.raw:
                 s = step.procres.stderr.split("[INFO ] k-induction proofed in depth ")
                 if len(s) == 2:
-                    conf += f" --start {int(s[1].strip())}"
+                    start_idx = int(s[1].strip())
+                    conf = conf.custom_version(f" --start {start_idx}",
+                                               f"start-{start_idx}")
+
         proofs.append(prove(conf, root_hash, step.step, step.props, rel_log_path_root, bd,
                             expected_memory=step.procres.max_mem * 1.1))
     return list(zip(await asyncio.gather(*proofs), strategies))
