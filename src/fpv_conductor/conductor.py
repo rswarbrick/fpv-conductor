@@ -322,20 +322,23 @@ class ProcessRunner:
     POLL_DELAY = 0.1 # Time between poll cycles
     MAX_RUNNING = (psutil.cpu_count() or 8) - 2 # Number of CPUs, with a couple spares
 
-    def __init__(self, args):
+    def __init__(self,
+                 args,
+                 max_mem_gb: float):
         self.pending: list[tuple[Process, Path | None]] = []
         self.running: list[tuple[Process, tuple[Path, typing.IO] | None]] = []
         self.first_start = time.time()
         self.debug_count = 0
+        self._max_mem_gb = max_mem_gb
 
         self.args = args
 
-        # Check that args.max_mem is more than twice as big as
+        # Check that max_mem_gb is more than twice as big as
         # GLOBAL_MEMORY_BUFFER. The latter is meant to be "some extra buffering
         # space", so it definitely shouldn't be as much as half of the total
         # space available.
-        if (args.max_mem <= 2 * ProcessRunner.GLOBAL_MEMORY_BUFFER):
-            msg = (f"The allowed RAM is {args.max_mem} GiB, which is not more than twice "
+        if (max_mem_gb <= 2 * ProcessRunner.GLOBAL_MEMORY_BUFFER):
+            msg = (f"The allowed RAM is {max_mem_gb} GiB, which is not more than twice "
                    f"the size of the buffer memory "
                    f"({ProcessRunner.GLOBAL_MEMORY_BUFFER} GiB)")
             raise RuntimeError(msg)
@@ -354,9 +357,10 @@ class ProcessRunner:
         return sum(proc.max_memory for proc, _ in self.running)
 
     def mem_avail(self):
-        if self.args.max_mem == 0:
+        if self._max_mem_gb == 0:
             return global_memory_free()
-        return min(global_memory_free(), max(self.args.max_mem - self.children_used_mem(), 0))
+        return min(global_memory_free(),
+                   max(self._max_mem_gb - self.children_used_mem(), 0))
 
     def poll(self):
         # Kill recently started processes until memory is OK, unless there is just one, then there's no point(?)
@@ -1266,7 +1270,10 @@ def split_step_name(name: str) -> tuple[int, str]:
     return int(m.group(1)), m.group(2)
 
 
-async def async_main(args: argparse.Namespace, root_hash: str, bd: BuildDir):
+async def async_main(args: argparse.Namespace,
+                     max_mem_gb: float,
+                     root_hash: str,
+                     bd: BuildDir):
     global process_runner
 
     def group_by_step(names: list[tuple[int, str]], max=None) -> list[list[str]]:
@@ -1280,7 +1287,7 @@ async def async_main(args: argparse.Namespace, root_hash: str, bd: BuildDir):
                 by_step.append([])
         return by_step
 
-    process_runner = ProcessRunner(args)
+    process_runner = ProcessRunner(args, max_mem_gb)
     process_runner.start_loop()
 
     log("Reading property list", c=white)
@@ -1362,8 +1369,18 @@ def main():
     parser.add_argument("--no-run", action="store_true", help="In explore mode don't run proofs again to check steps.")
     parser.add_argument("--no-kill", action="store_true", help="Don't kill proof processes due to running out of memory.")
     parser.add_argument("--check-complete", action="store_true", help="In prove mode, fail if there are unskipped properties without proofs.")
-    parser.add_argument("--max-mem", type=float, default=0, help="Max memory in GB, otherwise use all available memory")
+    parser.add_argument("--frac-mem", type=float, default=0.5,
+                        help=("The fraction of the machine's RAM to allocate. "
+                              "Default: 0.5 (which is 50 percent)"))
     args = parser.parse_args()
+
+    # Check that frac_mem is positive and not more than 1
+    if args.frac_mem <= 0 or 1 < args.frac_mem:
+        raise RuntimeError(f"Invalid --frac-mem value: {args.frac_mem}. "
+                           "It must be in the range (0, 1].")
+    # Convert frac_mem into a size is GiB.
+    mem = psutil.virtual_memory()
+    max_mem_gb = (mem.total / GB) * args.frac_mem
 
     if len(SKIPPED_PROPS) > 0:
         log(f"WARNING: Skipped properties are {' '.join(SKIPPED_PROPS)}", c=orange)
@@ -1373,4 +1390,4 @@ def main():
     ROOT_HASH = hashlib.new("sha256", bd.filepath(bd.aig).read_bytes()).hexdigest()
     log(f"{bd.filepath(bd.aig)} has sha256 {ROOT_HASH}")
 
-    asyncio.run(async_main(args, ROOT_HASH, bd))
+    asyncio.run(async_main(args, max_mem_gb, ROOT_HASH, bd))
