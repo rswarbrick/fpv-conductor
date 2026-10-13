@@ -209,8 +209,20 @@ class ProcessResult:
         self.stderr: str | None = stderr
 
     @staticmethod
-    def from_proc(proc, code, reason, max_mem, dt):
-        return ProcessResult(code, reason, max_mem, dt, proc.stdout.read().decode(), proc.stderr.read().decode())
+    def from_proc(proc: subprocess.Popen,
+                  code: int | None,
+                  reason: str,
+                  max_mem: float,
+                  dt: float):
+        stdout_contents: str | None = None
+        stderr_contents: str | None = None
+        if proc.stdout is not None:
+            stdout_contents = proc.stdout.read().decode()
+        if proc.stderr is not None:
+            stderr_contents = proc.stderr.read().decode()
+        return ProcessResult(code, reason, max_mem, dt,
+                             stdout_contents,
+                             stderr_contents)
 
 '''
 A process, which me killed, restarted and awaited (via the .future property).
@@ -243,9 +255,12 @@ class Process:
         self.max_memory = 0
         self.start_time = 0
 
-    def start(self):
+    def start(self, log_file: typing.IO | None):
         log("$", self.cmd)
-        self.proc = subprocess.Popen(self.cmd, shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.proc = subprocess.Popen(self.cmd, shell=True,
+                                     stdin=subprocess.DEVNULL,
+                                     stdout=log_file,
+                                     stderr=log_file)
         self.psproc = psutil.Process(pid=self.proc.pid)
         self.start_time = time.time()
         self.max_memory = 0
@@ -382,11 +397,13 @@ class ProcessRunner:
             self.pending.pop()
 
             if next_log_path is not None:
-                next_log_pair = (next_log_path, open(next_log_path, 'w'))
+                next_log_file = open(next_log_path, 'w')
+                next_log_pair = (next_log_path, next_log_file)
             else:
+                next_log_file = None
                 next_log_pair = None
 
-            next_job.start()
+            next_job.start(next_log_file)
             free -= max(next_job.expected_memory, 3) # otherwise lots of zeros won't help
             self.running.append((next_job, next_log_pair))
 
@@ -959,7 +976,7 @@ def split_by_prefixes(names: list[str]) -> PropTree:
 # ---------------------------------- Main ------------------------------
 
 
-def decode_strategy(encoded: list, fresh: bool) -> Strategy:
+def decode_strategy(encoded: list) -> Strategy:
     return Strategy(encoded[0], encoded[1], encoded[2], ProcessResult(encoded[3][0], encoded[3][3], encoded[3][1], encoded[3][2], encoded[3][4] if len(encoded[3]) > 4 else None, encoded[3][5] if len(encoded[3]) > 5 else None))
 
 def load_strategy(step: int, fresh: bool) -> list[Strategy] | None:
@@ -969,7 +986,7 @@ def load_strategy(step: int, fresh: bool) -> list[Strategy] | None:
         with open(f"strategies/step{step}.json", "r") as f:
             log(f"Loading strategy for step {step} from cache", c=white)
             encoded = json.load(f)
-        return [decode_strategy(d, fresh) for d in encoded]
+        return [decode_strategy(d) for d in encoded]
     except FileNotFoundError:
         pass
     except json.JSONDecodeError as e:
@@ -983,14 +1000,14 @@ def store_strategy(step: int,
     encoded = [[s.step, s.props, s.config, [s.procres.code, s.procres.max_mem, s.procres.dt, s.procres.reason, s.procres.stdout, s.procres.stderr]] for s in strategy]
     log(encoded, c=gray)
     if no_store:
-        return [decode_strategy(d, fresh) for d in encoded]
+        return [decode_strategy(d) for d in encoded]
     try:
         os.makedirs("strategies", exist_ok=True)
         with open(f"strategies/step{step}.json", "w") as f:
             json.dump(encoded, f)
     except Exception as e:
         log(f"ERROR: Could not save strategy: {e}", c=red)
-    return [decode_strategy(d, fresh) for d in encoded]
+    return [decode_strategy(d) for d in encoded]
 
 def missing_from(strategy: list[Strategy], props: list[str]) -> list[str]:
     done_props: list[str] = []
