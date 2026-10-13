@@ -7,7 +7,6 @@
 # counterexamples, and analyse the results.
 
 import asyncio
-import argparse
 import re
 import subprocess
 import time
@@ -22,17 +21,10 @@ import typing
 import psutil
 from pathlib import Path
 
+from .config import AppConfig, Mode
+
 # Skipped properties are excluded from every step
-SKIPPED_PROPS = [
-    'MType_Div_Data',
-    'MType_Rem_Data',
-    'MType_Mul_Data',
-    'MType_RemU_Data',
-    'MType_MulH_Data',
-    'MType_DivU_Data',
-    'MType_MulHU_Data',
-    'MType_MulHSH_Data',
-]
+SKIPPED_PROPS = set()
 
 # --------------------- Utilities ----------------------
 
@@ -322,28 +314,26 @@ class ProcessRunner:
     POLL_DELAY = 0.1 # Time between poll cycles
     MAX_RUNNING = (psutil.cpu_count() or 8) - 2 # Number of CPUs, with a couple spares
 
-    def __init__(self,
-                 args,
-                 max_mem_gb: float):
+    def __init__(self, cfg: AppConfig):
+        self._cfg = cfg
+
         self.pending: list[tuple[Process, Path | None]] = []
         self.running: list[tuple[Process, tuple[Path, typing.IO] | None]] = []
         self.first_start = time.time()
         self.debug_count = 0
-        self._max_mem_gb = max_mem_gb
-
-        self.args = args
 
         # Check that max_mem_gb is more than twice as big as
         # GLOBAL_MEMORY_BUFFER. The latter is meant to be "some extra buffering
         # space", so it definitely shouldn't be as much as half of the total
         # space available.
-        if (max_mem_gb <= 2 * ProcessRunner.GLOBAL_MEMORY_BUFFER):
-            msg = (f"The allowed RAM is {max_mem_gb} GiB, which is not more than twice "
-                   f"the size of the buffer memory "
+        if (cfg.max_mem_gb <= 2 * ProcessRunner.GLOBAL_MEMORY_BUFFER):
+            msg = (f"The allowed RAM is {cfg.max_mem_gb} GiB, which is not "
+                   "more than twice the size of the buffer memory "
                    f"({ProcessRunner.GLOBAL_MEMORY_BUFFER} GiB)")
             raise RuntimeError(msg)
 
-        log(f"Process runner will have a maximum of {ProcessRunner.MAX_RUNNING} processes, "
+        log(f"Process runner will have a maximum of "
+            "{ProcessRunner.MAX_RUNNING} processes, "
             f"and currently sees {self.mem_avail():.3f}GB free.")
 
     def enqueue(self, proc: Process, out_file: Path | None):
@@ -357,15 +347,15 @@ class ProcessRunner:
         return sum(proc.max_memory for proc, _ in self.running)
 
     def mem_avail(self):
-        if self._max_mem_gb == 0:
+        if self._cfg.max_mem_gb == 0:
             return global_memory_free()
         return min(global_memory_free(),
-                   max(self._max_mem_gb - self.children_used_mem(), 0))
+                   max(self._cfg.max_mem_gb - self.children_used_mem(), 0))
 
     def poll(self):
         # Kill recently started processes until memory is OK, unless there is just one, then there's no point(?)
         free = self.mem_avail()
-        while not self.args.no_kill and free < ProcessRunner.GLOBAL_MEMORY_BUFFER and len(self.running) > 1:
+        while not self._cfg.no_kill and free < ProcessRunner.GLOBAL_MEMORY_BUFFER and len(self.running) > 1:
             last, last_path_file = self.running.pop()
             last.kill_restart()
 
@@ -1270,10 +1260,9 @@ def split_step_name(name: str) -> tuple[int, str]:
     return int(m.group(1)), m.group(2)
 
 
-async def async_main(args: argparse.Namespace,
-                     max_mem_gb: float,
-                     root_hash: str,
-                     bd: BuildDir):
+async def async_main(cfg: AppConfig,
+                     bd: BuildDir,
+                     root_hash: str):
     global process_runner
 
     def group_by_step(names: list[tuple[int, str]], max=None) -> list[list[str]]:
@@ -1287,7 +1276,7 @@ async def async_main(args: argparse.Namespace,
                 by_step.append([])
         return by_step
 
-    process_runner = ProcessRunner(args, max_mem_gb)
+    process_runner = ProcessRunner(cfg)
     process_runner.start_loop()
 
     log("Reading property list", c=white)
@@ -1307,7 +1296,7 @@ async def async_main(args: argparse.Namespace,
 
     by_step = group_by_step(names)
     props: list[tuple[int, str]] = []
-    for prop in args.properties:
+    for prop in (cfg.properties or []):
         for step, name in names:
             if prop == name:
                 props.append((step, prop))
@@ -1315,9 +1304,9 @@ async def async_main(args: argparse.Namespace,
         else:
             log(f"ERROR: Property not found {prop}", c=red)
             exit(1)
-    if args.missing:
+    if cfg.missing:
         for step, sprops in enumerate(by_step):
-            strategy = load_strategy(step, args.fresh)
+            strategy = load_strategy(step, cfg.fresh)
             if strategy is None:
                 continue
             props.extend([(step, p) for p in missing_from(strategy, sprops)])
@@ -1332,62 +1321,32 @@ async def async_main(args: argparse.Namespace,
     skipped_by_step = group_by_step(props_skipped, max_step)
     by_step = group_by_step(props, max_step)
 
-    match args.mode:
-        case "bmc":
+    match cfg.mode:
+        case Mode.BMC:
             await bmc_mode(root_hash, props,
-                           args.bmc_start, args.bmc_step, bd)
-        case "info":
-            await info_mode(by_step, skipped_by_step, args.fresh)
-        case "prove":
+                           cfg.bmc_start, cfg.bmc_step, bd)
+        case Mode.INFO:
+            await info_mode(by_step, skipped_by_step, cfg.fresh)
+        case Mode.PROVE:
             await prove_mode(root_hash, props, by_step,
-                             args.fresh, args.start,
-                             args.by_step, args.check_complete, bd)
-        case "explore":
+                             cfg.fresh, cfg.start,
+                             cfg.by_step, cfg.check_complete, bd)
+        case Mode.EXPLORE:
             await explore_mode(root_hash, by_step,
-                               args.fresh, args.no_store,
-                               args.start, args.hard, args.no_run, bd)
+                               cfg.fresh, cfg.no_store,
+                               cfg.start, cfg.hard, cfg.no_run, bd)
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="conductor.py", description="Constructs and executes proofs.", epilog="Additionally, the PROOFLOG env var sets the prooflog file (i.e. one proof result per line, JSON), and the LOGFILE env var sets the logging file.")
-    parser.add_argument("mode", choices=["prove", "explore", "bmc", "info"],
-                        help="Proof mode. "
-                        "prove will run existing proofs where they exist, "
-                        "explore will attempt to discover new proofs, "
-                        "bmc will do bounded model checking on each property individually, "
-                        "info dumps stats about cached proofs.")
-    parser.add_argument("--build-dir", type=Path, default=Path("build"), help="The directory in which to work")
-    parser.add_argument("--fresh", action="store_true", help="In explore mode, do not use already constructed proofs, always construct new proofs.")
-    parser.add_argument("--no-store", action="store_true", help="In explore mode, do not store constructed proof strategies.")
-    parser.add_argument("--by-step", action="store_true", help="In prove mode, do proofs one step at a time")
-    parser.add_argument("-p", "--properties", nargs="*", default=[], help="Restrict to only the properties with the given names, otherwise all properties. Especially helpful for BMC.")
-    parser.add_argument("--missing", action="store_true", help="Equivalent to -p <each property that is not skipped but has no proof in a step where there are some proofs>")
-    parser.add_argument("-s", "--start", type=int, default=0, help="First step to start at. (default: 0)")
-    parser.add_argument("--bmc-step", type=int, default=1, help="Step size for BMC. (default: 1)")
-    parser.add_argument("--bmc-start", type=int, default=4, help="Start length for BMC. (default: 4)")
-    parser.add_argument("--hard", action="store_true", help="In explore mode, try harder to prove properties (1hr timeout, more engines).")
-    parser.add_argument("--no-run", action="store_true", help="In explore mode don't run proofs again to check steps.")
-    parser.add_argument("--no-kill", action="store_true", help="Don't kill proof processes due to running out of memory.")
-    parser.add_argument("--check-complete", action="store_true", help="In prove mode, fail if there are unskipped properties without proofs.")
-    parser.add_argument("--frac-mem", type=float, default=0.5,
-                        help=("The fraction of the machine's RAM to allocate. "
-                              "Default: 0.5 (which is 50 percent)"))
-    args = parser.parse_args()
-
-    # Check that frac_mem is positive and not more than 1
-    if args.frac_mem <= 0 or 1 < args.frac_mem:
-        raise RuntimeError(f"Invalid --frac-mem value: {args.frac_mem}. "
-                           "It must be in the range (0, 1].")
-    # Convert frac_mem into a size is GiB.
-    mem = psutil.virtual_memory()
-    max_mem_gb = (mem.total / GB) * args.frac_mem
+    cfg = AppConfig.from_args()
 
     if len(SKIPPED_PROPS) > 0:
-        log(f"WARNING: Skipped properties are {' '.join(SKIPPED_PROPS)}", c=orange)
+        log(f"WARNING: Skipped properties are {' '.join(SKIPPED_PROPS)}",
+            c=orange)
 
-    bd = BuildDir(args.build_dir)
+    bd = BuildDir(cfg.build_dir)
 
     ROOT_HASH = hashlib.new("sha256", bd.filepath(bd.aig).read_bytes()).hexdigest()
     log(f"{bd.filepath(bd.aig)} has sha256 {ROOT_HASH}")
 
-    asyncio.run(async_main(args, max_mem_gb, ROOT_HASH, bd))
+    asyncio.run(async_main(cfg, bd, ROOT_HASH))
