@@ -8,11 +8,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1791730054,
-        "narHash": "sha256-zL063GbNtcrVe7UI+SW7f1VDgKnhpmADt2vH1uTHkk8=",
+        "lastModified": 1791965857,
+        "narHash": "sha256-F5mCLSdQirr7NkbDBGMpsVhUIH39i2Y1BsTUWT8hdwI=",
         "ref": "refs/heads/main",
-        "rev": "3a52204f265d6e5b21207820d08d9e4b0574e192",
-        "revCount": 2,
+        "rev": "027b3763739d79f27006c13d467b36ea66734828",
+        "revCount": 3,
         "type": "git",
         "url": "https://github.com/rswarbrick/aig-manip"
       },
