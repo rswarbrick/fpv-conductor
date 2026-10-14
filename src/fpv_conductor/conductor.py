@@ -576,12 +576,14 @@ async def prove(config: Config,
     prep_log_path = log_path_root.with_name(log_path_root.name + '.prep.log')
     prove_log_path = log_path_root.with_name(log_path_root.name + prove_suffix)
 
-    specialised = await prepare_aiger(step, props, prep_log_path, bd)
-    res = await shell(f"{config.raw} {specialised}",
+    specialised_basename = await prepare_aiger(step, props, prep_log_path, bd)
+    specialised_path = bd.filepath(specialised_basename)
+
+    res = await shell(f"{config.raw} {specialised_path}",
                       prove_log_path,
                       timeout=timeout,
                       exp_memory=expected_memory)
-    proof_done(config, root_hash, specialised, step, props, res)
+    proof_done(config, root_hash, specialised_basename, step, props, res)
     return res
 
 cex_id = 0
