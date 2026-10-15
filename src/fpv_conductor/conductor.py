@@ -23,6 +23,7 @@ import psutil
 from pathlib import Path
 
 from .config import AppConfig, Mode
+from .engine import Config, proof_done, set_prooflog_path
 from .failed_cmd import FailedCmd
 from .log import (set_logfile, flush_logfile,
                   log, gray, green, orange, red, white)
@@ -32,8 +33,6 @@ from .process import Process, ProcessResult
 SKIPPED_PROPS = set()
 
 # --------------------- Utilities ----------------------
-
-PROOFLOG = os.environ.get("PROOFLOG", "prooflog.txt")
 
 @dataclass
 class BuildDir:
@@ -335,61 +334,6 @@ async def prepare_aiger(hier_pfx: str | None,
 
     return name
 
-@dataclass
-class Config:
-    '''An engine configuration'''
-    raw: str
-    """The description of the config to pass to the engine"""
-
-    desc: str
-    """Short description of config (used for log file names)"""
-
-    def custom_version(self, raw_suff: str, desc_suff: str):
-        return Config(f"{self.raw} {raw_suff}", f"{self.desc}.{desc_suff}")
-
-
-'''Log a nice message on proof completion, and store in the proof log'''
-def proof_done(engine_config: Config,
-               root_hash: str,
-               path: str,
-               step: int,
-               props: list[str],
-               procres: ProcessResult):
-    if not "NO_LOG" in os.environ:
-        with open(PROOFLOG, "a") as f:
-            json.dump([time.time(), [props, step, root_hash, engine_config.raw], vars(procres)], f)
-            f.write("\n")
-    match procres.code:
-        case 20:
-            log(f"UNSAT: {len(props)} properties in step {step} proven in {procres.dt:.3f}s with {procres.max_mem:.3f}GB", c=green)
-        case 10:
-            log(f"==========================================================================================================================", c=red)
-            log(f"==========================================================================================================================", c=red)
-            log(f"==========================================================================================================================", c=red)
-            log(f"       ==================== SAT: CEX in step {step}, discovered in {procres.dt:.3f}s with {procres.max_mem:.3f}GB ==================", c=red)
-            log(f"==========================================================================================================================", c=red)
-            log(f"==========================================================================================================================", c=red)
-            log(f"==========================================================================================================================", c=red)
-            log(f"One of these properties in step {step} is not valid: {' '.join(props)}", c=red)
-            log(f"To recover a witness run the following:")
-            log(f"    {engine_config.raw} {path} --witness | tail -n +2 > witness.aiw")
-            log(f"Or the following:")
-            log(f"    rIC3 -e bmc --no-preproc {path} --witness | tail -n +2 > witness.aiw")
-            log(f"Or, to compare against another engine:")
-            log(f"    python3 smt2manip.py build/all.smt2 sel.smt2 {step} {' '.join(props)}")
-            log(f"    yosys-smtbmc -s yices sel.smt2")
-            log(f"Then to view the trace:")
-            log(f"    build/aig-manip build/all.aig simulate build/all.ywmap build/all.vmap witness.aiw trace.vcd")
-            log(f"    gtkwave trace.vcd")
-        case 30:
-            log(f"UNDETERMINED: Failed to find a CEX or proof for {len(props)} properties in step {step} ({procres.dt:.3f}s with {procres.max_mem:.3f}GB)", c=orange)
-        case -9:
-            log(f"KILLED by OS: Failed to prove {len(props)} properties in step {step} ({procres.dt:.3f}s with {procres.max_mem:.3f}GB)", c=red)
-        case None:
-            log(f"TIMEOUT: Failed to prove {len(props)} properties in step {step} ({procres.dt:.3f}s with {procres.max_mem:.3f}GB)", c=red)
-        case n:
-            log(f"Unknown Exit Code {n}: Failed to prove {len(props)} properties in step {step} ({procres.dt:.3f}s with {procres.max_mem:.3f}GB)", c=red)
-
 async def prove(config: Config,
                 hier_pfx: str | None,
                 root_hash: str,
@@ -559,14 +503,15 @@ async def explore(root_hash: str,
     specialised = await prepare_aiger(hier_pfx, step, props, prep_log_path, bd)
 
     async def explore_one(cfg: Config,
-                          expected_memory: float) -> tuple[Config, ProcessResult] | None:
+                          exp_memory: float) -> tuple[Config,
+                                                      ProcessResult] | None:
         exp_suffix = '.explore.' + cfg.desc + '.log'
         exp_log_path = log_path_root.with_name(log_path_root.name + exp_suffix)
 
         result = await shell(f"{cfg.raw} {specialised}",
                              exp_log_path,
                              timeout=timeout,
-                             exp_memory=expected_memory,
+                             exp_memory=exp_memory,
                              debug_slow=debug_slow)
 
         proof_done(cfg, root_hash, specialised, step, props, result)
@@ -1260,6 +1205,7 @@ def main() -> int:
 
     bd = BuildDir(cfg.build_dir)
     set_logfile(bd.open('logfile.txt', 'a'))
+    set_prooflog_path(bd.filepath('prooflog.txt'))
 
     ROOT_HASH = hashlib.new("sha256", bd.filepath(bd.aig).read_bytes()).hexdigest()
     log(f"{bd.filepath(bd.aig)} has sha256 {ROOT_HASH}")
