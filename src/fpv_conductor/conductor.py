@@ -12,6 +12,8 @@ import subprocess
 import time
 import json
 import os
+import sys
+
 from math import floor
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,6 +24,7 @@ import psutil
 from pathlib import Path
 
 from .config import AppConfig, Mode
+from .failed_cmd import FailedCmd
 
 # Skipped properties are excluded from every step
 SKIPPED_PROPS = set()
@@ -478,8 +481,7 @@ async def prepare_aiger(step: int, props: list[str], log_path: Path, bd: BuildDi
     cmd = bd.aig_manip_select_cmd(bd.filepath(name), step, props)
     retcode = (await shell(cmd, log_path, exp_memory=0.5)).code
     if retcode != 0:
-        msg = f"Failed to run {cmd}. Return code {retcode} != 0."
-        raise RuntimeError(msg)
+        raise FailedCmd(cmd, retcode, log_path)
 
     return name
 
@@ -1356,7 +1358,7 @@ async def async_main(cfg: AppConfig,
                                cfg.start, cfg.hard, cfg.no_run, bd)
 
 
-def main():
+def main() -> int:
     cfg = AppConfig.from_args()
 
     if len(SKIPPED_PROPS) > 0:
@@ -1368,4 +1370,17 @@ def main():
     ROOT_HASH = hashlib.new("sha256", bd.filepath(bd.aig).read_bytes()).hexdigest()
     log(f"{bd.filepath(bd.aig)} has sha256 {ROOT_HASH}")
 
-    asyncio.run(async_main(cfg, bd, ROOT_HASH))
+    try:
+        asyncio.run(async_main(cfg, bd, ROOT_HASH))
+    except FailedCmd as fcmd:
+        print(f"Failed command (retcode {fcmd.retcode}):\n"
+              f"  {fcmd.cmd}\n",
+              file=sys.stderr)
+        if fcmd.log_path is not None:
+            print(f"Log file ({fcmd.log_path}) ends with the following lines:")
+            with open(fcmd.log_path) as log_file:
+                lines = log_file.readlines()
+                print("".join(lines[-10:]), end="", file=sys.stderr)
+        return 1
+
+    return 0
