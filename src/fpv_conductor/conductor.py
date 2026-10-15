@@ -24,7 +24,8 @@ from pathlib import Path
 
 from .config import AppConfig, Mode
 from .failed_cmd import FailedCmd
-from .log import log, gray, green, orange, red, white
+from .log import (set_logfile, flush_logfile,
+                  log, gray, green, orange, red, white)
 from .process import Process, ProcessResult
 
 # Skipped properties are excluded from every step
@@ -1258,6 +1259,7 @@ def main() -> int:
             c=orange)
 
     bd = BuildDir(cfg.build_dir)
+    set_logfile(bd.open('logfile.txt', 'a'))
 
     ROOT_HASH = hashlib.new("sha256", bd.filepath(bd.aig).read_bytes()).hexdigest()
     log(f"{bd.filepath(bd.aig)} has sha256 {ROOT_HASH}")
@@ -1280,6 +1282,7 @@ def main() -> int:
         # running us)
         print('(KeyboardInterrupt)', file=sys.stderr)
         signal.signal(signal.SIGINT, signal.SIG_DFL)
+        flush_logfile()
         os.kill(os.getpid(), signal.SIGINT)
         # This shouldn't be reachable: the SIGINT should have killed us.
         assert False
