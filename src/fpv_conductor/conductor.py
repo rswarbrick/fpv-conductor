@@ -12,6 +12,7 @@ import subprocess
 import time
 import json
 import os
+import signal
 import sys
 
 from math import floor
@@ -1427,5 +1428,14 @@ def main() -> int:
                 lines = log_file.readlines()
                 print("".join(lines[-10:]), end="", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        # We've taken a SIGINT. Remove Python's filtering and kill ourselves
+        # again with the same signal (which will look "right" for any program
+        # running us)
+        print('(KeyboardInterrupt)', file=sys.stderr)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
+        # This shouldn't be reachable: the SIGINT should have killed us.
+        assert False
 
     return 0
