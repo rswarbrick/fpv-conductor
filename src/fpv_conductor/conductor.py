@@ -1157,6 +1157,7 @@ async def prove_mode(root_hash: str,
     '''
 
     all_strategies: list[Strategy] = []
+    num_skipped = 0
     for step, props in enumerate(by_step):
         if step < start:
             log(f"Skipping step {step}", c=orange)
@@ -1164,6 +1165,7 @@ async def prove_mode(root_hash: str,
         strategy = load_strategy(step, fresh)
         if strategy is None or len(strategy) == 0:
             log(f"No strategy for step {step}, skipping", c=orange)
+            num_skipped += 1
             continue
 
         if work_by_step:
@@ -1174,6 +1176,14 @@ async def prove_mode(root_hash: str,
             run_dt = time.time() - run_start
             log(f"Ran strategy for step {step} in {run_dt:.3f}s", c=white)
         all_strategies.extend(strategy)
+
+    # At this point, there should be at least one strategy in all_strategies.
+    if not all_strategies:
+        msg = "No strategies needed proving."
+        if num_skipped:
+            msg += (f" But number skipped was {num_skipped}. "
+                    "Missing call to explore?")
+        raise RuntimeError(msg)
 
     if check_complete:
         covered: set[str] = set()
