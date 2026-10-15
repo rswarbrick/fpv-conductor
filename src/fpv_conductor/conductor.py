@@ -622,14 +622,16 @@ def load_strategy(step: int, fresh: bool) -> list[Strategy] | None:
 
 def store_strategy(step: int,
                    strategy: list[Strategy],
-                   no_store: bool):
+                   no_store: bool,
+                   bd: BuildDir):
     encoded = [s.to_tree() for s in strategy]
     log(encoded, c=gray)
     if no_store:
         return [Strategy.parse(d) for d in encoded]
     try:
-        os.makedirs("strategies", exist_ok=True)
-        with open(f"strategies/step{step}.json", "w") as f:
+        strategies_dir = bd.filepath("strategies")
+        strategies_dir.mkdir(parents=True, exist_ok=True)
+        with open(strategies_dir / f"step{step}.json", "w") as f:
             json.dump(encoded, f)
     except Exception as e:
         log(f"ERROR: Could not save strategy: {e}", c=red)
@@ -842,7 +844,7 @@ async def construct_strategy(root_hash: str,
 
     build_dt = time.time() - build_start
     log(f"Constructed strategy for step {step} of {len(strategy)} proof steps in {build_dt:.3f}s", c=white)
-    strategy = store_strategy(step, strategy, no_store)
+    strategy = store_strategy(step, strategy, no_store, bd)
     return True, strategy, [f[1] for f in failures]
 
 async def explore_mode(root_hash: str,
