@@ -209,10 +209,13 @@ async def bmc(root_hash: str,
         log_path_root = bd.filepath(rel_log_path_root)
         sim_log_path = log_path_root.with_name(log_path_root.name + '.sim.log')
 
-        Path(f"witness-{own_id}.aiw").write_text(witness)
-        log(f"Written trace to witness-{own_id}.aiw", c=white)
-        await shell(bd.aig_manip_sim_cmd(f"witness-{own_id}.aiw",
-                                         f"trace-{own_id}.vcd"),
+        aiw_relpath = f"witness-{own_id}.aiw"
+        vcd_relpath = f"trace-{own_id}.aiw"
+
+        aiw_path = bd.filepath(aiw_relpath)
+        aiw_path.write_text(witness)
+        log(f"Written trace to {aiw_path}", c=white)
+        await shell(bd.aig_manip_sim_cmd(aiw_relpath, vcd_relpath),
                     sim_log_path)
         log(f"Produced VCD file at trace-{own_id}.vcd", c=white)
     return res
@@ -262,7 +265,9 @@ async def explore(root_hash: str,
     prep_suffix = '.explore.prep.log'
     prep_log_path = log_path_root.with_name(log_path_root.name + prep_suffix)
 
-    specialised = await prepare_aiger(hier_pfx, step, props, prep_log_path, bd)
+    specialised_basename = await prepare_aiger(hier_pfx, step, props,
+                                               prep_log_path, bd)
+    specialised_path = bd.filepath(specialised_basename)
 
     async def explore_one(cfg: Config,
                           exp_memory: float) -> tuple[Config,
@@ -270,13 +275,13 @@ async def explore(root_hash: str,
         exp_suffix = '.explore.' + cfg.desc + '.log'
         exp_log_path = log_path_root.with_name(log_path_root.name + exp_suffix)
 
-        result = await shell(f"{cfg.raw} {specialised}",
+        result = await shell(f"{cfg.raw} {specialised_path}",
                              exp_log_path,
                              timeout=timeout,
                              exp_memory=exp_memory,
                              debug_slow=debug_slow)
 
-        proof_done(cfg, root_hash, specialised, step, props, result)
+        proof_done(cfg, root_hash, specialised_basename, step, props, result)
         if result.code in {10, 20}:
             return cfg, result
 

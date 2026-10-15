@@ -33,7 +33,7 @@ class Config:
 
 def proof_done(engine_config: Config,
                root_hash: str,
-               path: str,
+               rel_path: str,
                step: int,
                props: list[str],
                procres: ProcessResult):
@@ -59,9 +59,9 @@ def proof_done(engine_config: Config,
             log(f"==========================================================================================================================", c=red)
             log(f"One of these properties in step {step} is not valid: {' '.join(props)}", c=red)
             log(f"To recover a witness run the following:")
-            log(f"    {engine_config.raw} {path} --witness | tail -n +2 > witness.aiw")
+            log(f"    {engine_config.raw} {rel_path} --witness | tail -n +2 > witness.aiw")
             log(f"Or the following:")
-            log(f"    rIC3 -e bmc --no-preproc {path} --witness | tail -n +2 > witness.aiw")
+            log(f"    rIC3 -e bmc --no-preproc {rel_path} --witness | tail -n +2 > witness.aiw")
             log(f"Or, to compare against another engine:")
             log(f"    python3 smt2manip.py build/all.smt2 sel.smt2 {step} {' '.join(props)}")
             log(f"    yosys-smtbmc -s yices sel.smt2")
