@@ -1038,7 +1038,7 @@ async def bmc_mode(root_hash: str,
     '''
     if len(props) == 1:
         step, prop = props[0]
-        log(f"Doing unbounded BMC for step on {prop} from step {step}", c=white)
+        log(f"Doing unbounded BMC on {prop} from step {step}", c=white)
         await bmc(root_hash, step, [prop], "bmc.single", bd, start=bmc_start)
         return
 
