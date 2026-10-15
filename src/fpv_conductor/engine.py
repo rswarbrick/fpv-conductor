@@ -31,6 +31,29 @@ class Config:
     def custom_version(self, raw_suff: str, desc_suff: str):
         return Config(f"{self.raw} {raw_suff}", f"{self.desc}.{desc_suff}")
 
+    def to_tree(self) -> dict:
+        return { "raw": self.raw, "desc": self.desc }
+
+    @staticmethod
+    def parse(tree: object) -> 'Config':
+        if not isinstance(tree, dict):
+            raise TypeError("Tree is not a dict.")
+
+        raw_raw = tree.get("raw")
+        if raw_raw is None:
+            raise ValueError("No raw key in tree.")
+        if not isinstance(raw_raw, str):
+            raise ValueError("raw in tree is not a string.")
+
+        raw_desc = tree.get("desc")
+        if raw_desc is None:
+            raise ValueError("No desc key in tree.")
+        if not isinstance(raw_desc, str):
+            raise ValueError("desc in tree is not a string.")
+
+        return Config(raw_raw, raw_desc)
+
+
 def proof_done(engine_config: Config,
                root_hash: str,
                rel_path: str,

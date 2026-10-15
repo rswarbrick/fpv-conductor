@@ -325,6 +325,48 @@ class Strategy:
     procres: ProcessResult
     """Result of the process that was run."""
 
+    def to_tree(self) -> dict:
+        return { "step": self.step,
+                 "props": self.props,
+                 "config": self.config.to_tree(),
+                 "procres": self.procres.to_tree() }
+
+    @staticmethod
+    def parse(tree: object) -> 'Strategy':
+        if not isinstance(tree, dict):
+            raise TypeError("Tree is not a dict.")
+
+        raw_step = tree.get('step')
+        if raw_step is None:
+            raise ValueError("No step key in tree.")
+        if not isinstance(raw_step, int):
+            raise ValueError("Step in tree is not an int.")
+
+        raw_props = tree.get('props')
+        if raw_props is None:
+            raise ValueError("No props key in tree.")
+        if not isinstance(raw_props, list):
+            raise ValueError("props in tree is not an list.")
+        props: list[str] = []
+        for i, raw_prop in enumerate(raw_props):
+            if not isinstance(raw_prop, str):
+                raise ValueError(f"property {i} is not a string.")
+            props.append(raw_prop)
+
+        raw_config = tree.get('config')
+        if raw_config is None:
+            raise ValueError("No config key in tree.")
+        config = Config.parse(raw_config)
+
+        raw_procres = tree.get('procres')
+        if raw_procres is None:
+            raise ValueError("No raw_procres key in tree.")
+        procres = ProcessResult.parse(raw_procres)
+
+        return Strategy(raw_step, props, config, procres)
+
+
+
 async def build_strategy_rec(root_hash: str,
                              hier_pfx: str | None,
                              step: int,
@@ -564,10 +606,6 @@ def split_by_prefixes(names: list[str]) -> PropTree:
 
 # ---------------------------------- Main ------------------------------
 
-
-def decode_strategy(encoded: list) -> Strategy:
-    return Strategy(encoded[0], encoded[1], encoded[2], ProcessResult(encoded[3][0], encoded[3][3], encoded[3][1], encoded[3][2], encoded[3][4] if len(encoded[3]) > 4 else None, encoded[3][5] if len(encoded[3]) > 5 else None))
-
 def load_strategy(step: int, fresh: bool) -> list[Strategy] | None:
     if fresh:
         return None
@@ -575,7 +613,7 @@ def load_strategy(step: int, fresh: bool) -> list[Strategy] | None:
         with open(f"strategies/step{step}.json", "r") as f:
             log(f"Loading strategy for step {step} from cache", c=white)
             encoded = json.load(f)
-        return [decode_strategy(d) for d in encoded]
+        return [Strategy.parse(d) for d in encoded]
     except FileNotFoundError:
         pass
     except json.JSONDecodeError as e:
@@ -585,17 +623,17 @@ def load_strategy(step: int, fresh: bool) -> list[Strategy] | None:
 def store_strategy(step: int,
                    strategy: list[Strategy],
                    no_store: bool):
-    encoded = [[s.step, s.props, s.config, [s.procres.code, s.procres.max_mem, s.procres.dt, s.procres.reason, s.procres.stdout, s.procres.stderr]] for s in strategy]
+    encoded = [s.to_tree() for s in strategy]
     log(encoded, c=gray)
     if no_store:
-        return [decode_strategy(d) for d in encoded]
+        return [Strategy.parse(d) for d in encoded]
     try:
         os.makedirs("strategies", exist_ok=True)
         with open(f"strategies/step{step}.json", "w") as f:
             json.dump(encoded, f)
     except Exception as e:
         log(f"ERROR: Could not save strategy: {e}", c=red)
-    return [decode_strategy(d) for d in encoded]
+    return [Strategy.parse(d) for d in encoded]
 
 def missing_from(strategy: list[Strategy], props: list[str]) -> list[str]:
     done_props: list[str] = []

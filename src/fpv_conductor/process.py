@@ -48,6 +48,61 @@ class ProcessResult:
                              stdout_contents,
                              stderr_contents)
 
+    def to_tree(self) -> dict:
+        ret: dict = {"code": self.code,
+                     "max_mem": self.max_mem,
+                     "dt": self.dt,
+                     "reason": self.reason}
+        if self.stdout is not None:
+            ret["stdout"] = self.stdout
+        if self.stderr is not None:
+            ret["stderr"] = self.stderr
+
+        return ret
+
+    @staticmethod
+    def parse(tree: object) -> 'ProcessResult':
+        if not isinstance(tree, dict):
+            raise TypeError("Tree is not a dict.")
+
+        raw_code = tree.get('code')
+        if raw_code is None:
+            raise ValueError("No code key in dict.")
+        if not isinstance(raw_code, int):
+            raise ValueError("code is not an int.")
+
+        raw_reason = tree.get('reason')
+        if raw_reason is None:
+            raise ValueError("No reason key in dict.")
+        if not isinstance(raw_reason, str):
+            raise ValueError("reason is not a string.")
+
+        raw_max_mem = tree.get('max_mem')
+        if raw_max_mem is None:
+            raise ValueError("No max_mem key in dict.")
+        if not (isinstance(raw_max_mem, float) or
+                isinstance(raw_max_mem, int)):
+            raise ValueError("max_mem is not a float.")
+
+        raw_dt = tree.get('dt')
+        if raw_dt is None:
+            raise ValueError("No dt key in dict.")
+        if not (isinstance(raw_dt, float) or
+                isinstance(raw_dt, int)):
+            raise ValueError("dt is not a float.")
+
+        raw_stdout = tree.get('stdout')
+        if raw_stdout is not None and not isinstance(raw_stdout, str):
+            raise ValueError("stdout is given and not a string.")
+
+        raw_stderr = tree.get('stderr')
+        if raw_stderr is not None and not isinstance(raw_stderr, str):
+            raise ValueError("stderr is given and not a string.")
+
+        return ProcessResult(raw_code, raw_reason,
+                             raw_max_mem, raw_dt,
+                             raw_stdout, raw_stderr)
+
 
 class ProcessFuture(asyncio.Future):
     '''
