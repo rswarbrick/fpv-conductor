@@ -578,7 +578,6 @@ def load_strategy(step: int, fresh: bool) -> list[Strategy] | None:
 
 def store_strategy(step: int,
                    strategy: list[Strategy],
-                   fresh: bool,
                    no_store: bool):
     encoded = [[s.step, s.props, s.config, [s.procres.code, s.procres.max_mem, s.procres.dt, s.procres.reason, s.procres.stdout, s.procres.stderr]] for s in strategy]
     log(encoded, c=gray)
@@ -799,7 +798,7 @@ async def construct_strategy(root_hash: str,
 
     build_dt = time.time() - build_start
     log(f"Constructed strategy for step {step} of {len(strategy)} proof steps in {build_dt:.3f}s", c=white)
-    strategy = store_strategy(step, strategy, fresh, no_store)
+    strategy = store_strategy(step, strategy, no_store)
     return True, strategy, [f[1] for f in failures]
 
 async def explore_mode(root_hash: str,
