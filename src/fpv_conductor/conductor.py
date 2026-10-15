@@ -47,12 +47,13 @@ async def race[A](tasks: Iterable[typing.Awaitable[A | None]]) -> A | None:
     winner = None
     try:
         async with asyncio.TaskGroup() as tg:
+            async def wrapper(task):
+                res = await task
+                if res is not None:
+                    raise RaceWonException(res)
             for task in tasks:
-                async def wrapper():
-                    res = await task
-                    if res is not None:
-                        raise RaceWonException(res)
-                tg.create_task(wrapper())
+                tg.create_task(wrapper(task))
+
     except* RaceWonException as e:
         for result in e.exceptions:
             assert isinstance(result, RaceWonException)
