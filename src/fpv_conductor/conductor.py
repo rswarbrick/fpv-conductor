@@ -90,18 +90,23 @@ class BuildDir:
         return path.open(mode)
 
     def aig_manip_select_cmd(self,
+                             hier_pfx: str | None,
                              out: Path,
                              step: int,
                              props: list[str]) -> str:
         """Return a command to select some props from self.aig
 
         Args:
-          out:   The output aig file to create.
-          step:  The step number for which we are constructing the aig
-          props: A list of the properties that should be kept
+          hier_pfx: A prefix for SystemVerilog hierarchical names.
+          out:      The output aig file to create.
+          step:     The step number for which we are constructing the aig
+          props:    A list of the properties that should be kept
         """
-        parts: list[str] = [
-            "aig-manip",
+        shared: list[str] = ["aig-manip"]
+        if hier_pfx is not None:
+            shared += [f"--hier-pfx={hier_pfx}"]
+
+        parts: list[str] = shared + [
             str(self.filepath(self.aig)),
             "select",
             str(out),
@@ -460,25 +465,32 @@ async def shell(cmd: str,
 # ------------------------ Proof Primitives ------------------
 
 aiger_idx = 0
-async def prepare_aiger(step: int, props: list[str], log_path: Path, bd: BuildDir) -> str:
+async def prepare_aiger(hier_pfx: str | None,
+                        step: int,
+                        props: list[str],
+                        log_path: Path,
+                        bd: BuildDir) -> str:
     '''Make an aiger file for the properties at the given step.
 
     Returns the (base) name of that file.
 
     Arguments:
 
-      step:  The index of the step that is being run.
+      hier_pfx: A SystemVerilog hierarchical path used as the prefix for all
+                properties.
 
-      props: A list of the properties that will be run in this step.
+      step:     The index of the step that is being run.
 
-      bd:    The directory in which the build is running.
+      props:    A list of the properties that will be run in this step.
+
+      bd:       The directory in which the build is running.
 
     '''
     global aiger_idx
 
     name = f"aiger-{aiger_idx}.aig"
     aiger_idx += 1
-    cmd = bd.aig_manip_select_cmd(bd.filepath(name), step, props)
+    cmd = bd.aig_manip_select_cmd(hier_pfx, bd.filepath(name), step, props)
     retcode = (await shell(cmd, log_path, exp_memory=0.5)).code
     if retcode != 0:
         raise FailedCmd(cmd, retcode, log_path)
@@ -541,6 +553,7 @@ def proof_done(engine_config: Config,
             log(f"Unknown Exit Code {n}: Failed to prove {len(props)} properties in step {step} ({procres.dt:.3f}s with {procres.max_mem:.3f}GB)", c=red)
 
 async def prove(config: Config,
+                hier_pfx: str | None,
                 root_hash: str,
                 step: int,
                 props: list[str],
@@ -552,7 +565,10 @@ async def prove(config: Config,
 
     Arguments:
 
-      engine_config:     The config to use.
+      config:            The engine config to use.
+
+      hier_pfx:          A SystemVerilog hierarchical path used as the prefix
+                         for all properties.
 
       root_hash:         The hash of the root AIG file.
 
@@ -578,7 +594,8 @@ async def prove(config: Config,
     prep_log_path = log_path_root.with_name(log_path_root.name + '.prep.log')
     prove_log_path = log_path_root.with_name(log_path_root.name + prove_suffix)
 
-    specialised_basename = await prepare_aiger(step, props, prep_log_path, bd)
+    specialised_basename = await prepare_aiger(hier_pfx, step, props,
+                                               prep_log_path, bd)
     specialised_path = bd.filepath(specialised_basename)
 
     res = await shell(f"{config.raw} {specialised_path}",
@@ -590,6 +607,7 @@ async def prove(config: Config,
 
 cex_id = 0
 async def bmc(root_hash: str,
+              hier_pfx: str | None,
               step: int,
               props: list[str],
               rel_log_path_root: str,
@@ -602,6 +620,9 @@ async def bmc(root_hash: str,
     Arguments:
 
       root_hash:         The hash of the root AIG file.
+
+      hier_pfx:          A SystemVerilog hierarchical path used as the prefix
+                         for all properties.
 
       step:              The index of the current step.
 
@@ -633,7 +654,7 @@ async def bmc(root_hash: str,
                ("" if end is None else f" --end {end}"))
     cfg = Config(raw_cfg, "bmc")
 
-    res = await prove(cfg, root_hash, step, props,
+    res = await prove(cfg, hier_pfx, root_hash, step, props,
                       rel_log_path_root, bd, timeout=timeout)
     if res.code == 10:
         assert res.stdout is not None
@@ -655,6 +676,7 @@ async def bmc(root_hash: str,
 # -------------------------- Proof Exploration -----------------------
 
 async def explore(root_hash: str,
+                  hier_pfx: str | None,
                   step: int,
                   props: list[str],
                   rel_log_path_root: str,
@@ -667,6 +689,9 @@ async def explore(root_hash: str,
     Arguments:
 
       root_hash:         The hash of the root AIG file.
+
+      hier_pfx:          A SystemVerilog hierarchical path used as the prefix
+                         for all properties.
 
       step:              The index of the current step.
 
@@ -693,7 +718,7 @@ async def explore(root_hash: str,
     prep_suffix = '.explore.prep.log'
     prep_log_path = log_path_root.with_name(log_path_root.name + prep_suffix)
 
-    specialised = await prepare_aiger(step, props, prep_log_path, bd)
+    specialised = await prepare_aiger(hier_pfx, step, props, prep_log_path, bd)
 
     async def explore_one(cfg: Config,
                           expected_memory: float) -> tuple[Config, ProcessResult] | None:
@@ -751,6 +776,7 @@ class Strategy:
     """Result of the process that was run."""
 
 async def build_strategy_rec(root_hash: str,
+                             hier_pfx: str | None,
                              step: int,
                              prop_tree: PropTree,
                              failures: list[tuple[int, str]],
@@ -765,6 +791,9 @@ async def build_strategy_rec(root_hash: str,
     Arguments:
 
       root_hash:         The hash of the root AIG file.
+
+      hier_pfx:          A SystemVerilog hierarchical path used as the prefix
+                         for all properties.
 
       step:              The index of the current step.
 
@@ -811,6 +840,7 @@ async def build_strategy_rec(root_hash: str,
     if len(all_props) == 1:
         while True:
             res = await explore(root_hash,
+                                hier_pfx,
                                 step,
                                 all_props,
                                 rel_log_path_root,
@@ -835,12 +865,12 @@ async def build_strategy_rec(root_hash: str,
     if len(prop_tree.children) == 1:
         the_child = prop_tree.children[0]
         assert isinstance(the_child, PropTree)
-        return await build_strategy_rec(root_hash, step,
+        return await build_strategy_rec(root_hash, hier_pfx, step,
                                         the_child, failures,
                                         rel_log_path_root, bd, difficult)
 
     async def without_split():
-        res = await explore(root_hash, step, all_props,
+        res = await explore(root_hash, hier_pfx, step, all_props,
                             rel_log_path_root, configs=ENGINES, bd=bd, timeout=120.0)
         if res is not None:
             if res[1].code == 20:
@@ -865,7 +895,7 @@ async def build_strategy_rec(root_hash: str,
             # parallel. Do this by calling build_strategy_rec again with "one
             # prop trees". Each instance will then immediately call explore().
             solutions = await asyncio.gather(
-                *[build_strategy_rec(root_hash, step,
+                *[build_strategy_rec(root_hash, hier_pfx, step,
                                      PropTree.mk_singleton(child),
                                      failures,
                                      rel_log_path_root,
@@ -877,7 +907,7 @@ async def build_strategy_rec(root_hash: str,
             # sub-trees and is followed by a list of single-item trees.
             strings_last = sub_trees + [PropTree.mk_singleton(r) for r in rest]
             solutions = await asyncio.gather(
-                *[build_strategy_rec(root_hash, step,
+                *[build_strategy_rec(root_hash, hier_pfx, step,
                                      tree,
                                      failures,
                                      rel_log_path_root,
@@ -894,12 +924,16 @@ async def build_strategy_rec(root_hash: str,
     return winner
 
 async def run_strategy(root_hash: str,
+                       hier_pfx: str | None,
                        strategies: list[Strategy],
                        rel_log_path_root: str,
                        bd: BuildDir) -> list[tuple[ProcessResult, Strategy]]:
     '''Execute a given strategy, return all the (result, strategy)
 
     Arguments:
+
+      hier_pfx:          A SystemVerilog hierarchical path used as the prefix
+                         for all properties.
 
       root_hash:         The hash of the root AIG file.
 
@@ -923,7 +957,8 @@ async def run_strategy(root_hash: str,
                     conf = conf.custom_version(f" --start {start_idx}",
                                                f"start-{start_idx}")
 
-        proofs.append(prove(conf, root_hash, step.step, step.props, rel_log_path_root, bd,
+        proofs.append(prove(conf, hier_pfx, root_hash, step.step, step.props,
+                            rel_log_path_root, bd,
                             expected_memory=step.procres.max_mem * 1.1))
     return list(zip(await asyncio.gather(*proofs), strategies))
 
@@ -1020,6 +1055,7 @@ def missing_from(strategy: list[Strategy], props: list[str]) -> list[str]:
     return list(set(props).difference(done_props))
 
 async def bmc_mode(root_hash: str,
+                   hier_pfx: str | None,
                    props: list[tuple[int, str]],
                    bmc_start: int,
                    bmc_step: int,
@@ -1029,6 +1065,9 @@ async def bmc_mode(root_hash: str,
     Arguments:
 
       root_hash:         The hash of the root AIG file.
+
+      hier_pfx:          A SystemVerilog hierarchical path used as the prefix
+                         for all properties.
 
       props:             A list of (step, prop) pairs.
 
@@ -1041,7 +1080,7 @@ async def bmc_mode(root_hash: str,
     if len(props) == 1:
         step, prop = props[0]
         log(f"Doing unbounded BMC on {prop} from step {step}", c=white)
-        await bmc(root_hash, step, [prop], "bmc.single", bd, start=bmc_start)
+        await bmc(root_hash, hier_pfx, step, [prop], "bmc.single", bd, start=bmc_start)
         return
 
     if len(props) == 0:
@@ -1051,7 +1090,7 @@ async def bmc_mode(root_hash: str,
     while True:
         for step, prop in props:
             log(f"Doing BMC at depth {i} on {prop} from step {step}", c=white)
-            await bmc(root_hash, step, [prop],
+            await bmc(root_hash, hier_pfx, step, [prop],
                       f"bmc.step{step}", bd, start=i, end=i)
         i += bmc_step
 
@@ -1080,6 +1119,7 @@ async def info_mode(by_step: list[list[str]],
     log(f"{total_steps} proof steps in total")
 
 async def prove_mode(root_hash: str,
+                     hier_pfx: str | None,
                      all_props: list[tuple[int, str]],
                      by_step: list[list[str]],
                      fresh: bool,
@@ -1092,6 +1132,9 @@ async def prove_mode(root_hash: str,
     Arguments:
 
       root_hash:         The hash of the root AIG file.
+
+      hier_pfx:          A SystemVerilog hierarchical path used as the prefix
+                         for all properties.
 
       all_props:         A list of (step, property) pairs.
 
@@ -1125,7 +1168,7 @@ async def prove_mode(root_hash: str,
         if work_by_step:
             log(f"Running strategy for step {step} ({len(props)} properties)", c=white)
             run_start = time.time()
-            await run_strategy(root_hash, strategy,
+            await run_strategy(root_hash, hier_pfx, strategy,
                                f"prove.step{step}", bd)
             run_dt = time.time() - run_start
             log(f"Ran strategy for step {step} in {run_dt:.3f}s", c=white)
@@ -1145,7 +1188,7 @@ async def prove_mode(root_hash: str,
     if not work_by_step:
         log(f"Running strategy for everything", c=white)
         run_start = time.time()
-        results = await run_strategy(root_hash, all_strategies,
+        results = await run_strategy(root_hash, hier_pfx, all_strategies,
                                      "prove.all", bd)
         run_dt = time.time() - run_start
         log(f"Ran strategy in {run_dt:.3f}s", c=white)
@@ -1163,6 +1206,7 @@ async def prove_mode(root_hash: str,
             exit(1) # Failed
 
 async def construct_strategy(root_hash: str,
+                             hier_pfx: str | None,
                              step: int,
                              props: list[str],
                              fresh: bool,
@@ -1182,7 +1226,7 @@ async def construct_strategy(root_hash: str,
     if hard:
         log("strategy: each property", c=white)
         strategies = \
-            await asyncio.gather(*[build_strategy_rec(root_hash,
+            await asyncio.gather(*[build_strategy_rec(root_hash, hier_pfx,
                                                       step,
                                                       PropTree.mk_singleton(prop),
                                                       failures,
@@ -1195,7 +1239,7 @@ async def construct_strategy(root_hash: str,
     else:
         log("strategy: name based recursive splitting, linear fallback", c=white)
         blocks = split_by_prefixes(not_done)
-        strategy += await build_strategy_rec(root_hash,
+        strategy += await build_strategy_rec(root_hash, hier_pfx,
                                              step, blocks, failures,
                                              rel_log_path_root, bd, difficult=hard)
 
@@ -1205,6 +1249,7 @@ async def construct_strategy(root_hash: str,
     return True, strategy, [f[1] for f in failures]
 
 async def explore_mode(root_hash: str,
+                       hier_pfx: str | None,
                        by_step: list[list[str]],
                        fresh: bool,
                        no_store: bool,
@@ -1219,7 +1264,7 @@ async def explore_mode(root_hash: str,
             continue
 
         new, strategy, failures = \
-            await construct_strategy(root_hash, step, props,
+            await construct_strategy(root_hash, hier_pfx, step, props,
                                      fresh, no_store, hard,
                                      "explore.strategy", bd)
         all_failures.extend(failures)
@@ -1231,7 +1276,7 @@ async def explore_mode(root_hash: str,
         elif not new or len(strategy) != 1:
             log(f"Running strategy for step {step} ({len(props)} properties)", c=white)
             run_start = time.time()
-            await run_strategy(root_hash, strategy, "explore.run", bd)
+            await run_strategy(root_hash, hier_pfx, strategy, "explore.run", bd)
             run_dt = time.time() - run_start
             log(f"Ran strategy for step {step} in {run_dt:.3f}s", c=white)
         else:
@@ -1344,16 +1389,16 @@ async def async_main(cfg: AppConfig,
 
     match cfg.mode:
         case Mode.BMC:
-            await bmc_mode(root_hash, props,
+            await bmc_mode(root_hash, cfg.hier_pfx, props,
                            cfg.bmc_start, cfg.bmc_step, bd)
         case Mode.INFO:
             await info_mode(by_step, skipped_by_step, cfg.fresh)
         case Mode.PROVE:
-            await prove_mode(root_hash, props, by_step,
+            await prove_mode(root_hash, cfg.hier_pfx, props, by_step,
                              cfg.fresh, cfg.start,
                              cfg.by_step, cfg.check_complete, bd)
         case Mode.EXPLORE:
-            await explore_mode(root_hash, by_step,
+            await explore_mode(root_hash, cfg.hier_pfx, by_step,
                                cfg.fresh, cfg.no_store,
                                cfg.start, cfg.hard, cfg.no_run, bd)
 

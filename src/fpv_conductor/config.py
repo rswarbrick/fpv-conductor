@@ -29,6 +29,7 @@ class Mode(StrEnum):
 class AppConfig:
     mode: Mode
     build_dir: Path
+    hier_pfx: str | None
     fresh: bool
     no_store: bool
     by_step: bool
@@ -66,6 +67,11 @@ class AppConfig:
                             default=Path("build"),
                             help=("The directory in which to work "
                                   "(default: build)"))
+
+        parser.add_argument("--hier-pfx",
+                            help=("The SystemVerilog hierarchical path for "
+                                  "the module where all the properties are "
+                                  "defined."))
 
         parser.add_argument("--fresh",
                             action="store_true",
@@ -140,6 +146,7 @@ class AppConfig:
 
         return AppConfig(Mode.from_str(args.mode),
                          args.build_dir,
+                         args.hier_pfx,
                          args.fresh,
                          args.no_store,
                          args.by_step,
