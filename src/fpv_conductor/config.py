@@ -5,10 +5,12 @@
 # Configuration arguments for conductor.py (which can be parsed by argparse)
 
 import argparse
+import psutil
+import typing
+
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-import psutil
 
 
 class Mode(StrEnum):
@@ -25,10 +27,107 @@ class Mode(StrEnum):
         msg = f"The name '{name}' is not a known mode."
         raise ValueError(msg)
 
+
+@dataclass
+class BuildDir:
+    path: Path
+    """The path to the directory."""
+
+    aig: str = 'all.aig'
+    """An aiger file with all the properties"""
+
+    ywmap: str = 'all.ywmap'
+    """A ywmap file for all the properties"""
+
+    smt2: str = 'all.smt2'
+    """An SMT2 file for all the properties"""
+
+    vmap: str = 'all.vmap'
+    """A vmap file for all the properties"""
+
+    def __post_init__(self):
+        if not self.path.is_dir():
+            raise RuntimeError(f"The path '{self.path}' is not a directory")
+
+        for basename in (self.aig, self.ywmap, self.smt2, self.vmap):
+            filepath = self.path / basename
+            if not filepath.is_file():
+                raise RuntimeError(f"The path '{filepath}' is not a file.")
+
+    def filepath(self, basename: str) -> Path:
+        """Return a Path for the given file in this directory."""
+        return self.path / basename
+
+    def open(self, rel_path: str, mode: str) -> typing.IO:
+        '''Open a file at rel_path inside the directory
+
+        If mode starts with 'w', 'x' or 'a' (so we might create a file), this
+        ensures the target directory exists.
+
+        Arguments:
+
+          rel_path:    The relative path (inside self.path) for the file to open.
+
+          mode:        The mode passed to the underlying open() call.
+        '''
+        path = self.filepath(rel_path)
+        if mode and (mode[0] in 'wxa'):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        return path.open(mode)
+
+    def aig_manip_select_cmd(self,
+                             hier_pfx: str | None,
+                             out: Path,
+                             step: int,
+                             props: list[str]) -> str:
+        """Return a command to select some props from self.aig
+
+        Args:
+          hier_pfx: A prefix for SystemVerilog hierarchical names.
+          out:      The output aig file to create.
+          step:     The step number for which we are constructing the aig
+          props:    A list of the properties that should be kept
+        """
+        shared: list[str] = ["aig-manip"]
+        if hier_pfx is not None:
+            shared += [f"--hier-pfx={hier_pfx}"]
+
+        parts: list[str] = shared + [
+            str(self.filepath(self.aig)),
+            "select",
+            str(out),
+            str(self.filepath(self.ywmap)),
+            str(step)
+        ]
+
+        return ' '.join(parts + props)
+
+    def aig_manip_sim_cmd(self,
+                          witness_aiw: str,
+                          trace_vcd: str) -> str:
+        """Return a command to select some props from self.aig
+
+        Args:
+          witness_aiw: An aiw file to use as a witness.
+          trace_vcd:  A VCD file to use as a trace.
+        """
+        parts: list[str] = [
+            "aig-manip",
+            str(self.filepath(self.aig)),
+            "simulate",
+            str(self.filepath(self.ywmap)),
+            str(self.filepath(self.vmap)),
+            str(witness_aiw),
+            str(trace_vcd)
+        ]
+
+        return ' '.join(parts)
+
+
 @dataclass
 class AppConfig:
     mode: Mode
-    build_dir: Path
+    build_dir: BuildDir
     hier_pfx: str | None
     fresh: bool
     no_store: bool
@@ -143,9 +242,8 @@ class AppConfig:
         mem = psutil.virtual_memory()
         max_mem_gb = (mem.total / (1024 ** 3)) * args.frac_mem
 
-
         return AppConfig(Mode.from_str(args.mode),
-                         args.build_dir,
+                         BuildDir(args.build_dir),
                          args.hier_pfx,
                          args.fresh,
                          args.no_store,

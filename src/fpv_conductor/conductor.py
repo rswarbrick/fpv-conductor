@@ -22,7 +22,7 @@ import typing
 import psutil
 from pathlib import Path
 
-from .config import AppConfig, Mode
+from .config import AppConfig, BuildDir, Mode
 from .engine import Config, proof_done, set_prooflog_path
 from .failed_cmd import FailedCmd
 from .log import (set_logfile, flush_logfile,
@@ -33,101 +33,6 @@ from .process import Process, ProcessResult
 SKIPPED_PROPS = set()
 
 # --------------------- Utilities ----------------------
-
-@dataclass
-class BuildDir:
-    path: Path
-    """The path to the directory."""
-
-    aig: str = 'all.aig'
-    """An aiger file with all the properties"""
-
-    ywmap: str = 'all.ywmap'
-    """A ywmap file for all the properties"""
-
-    smt2: str = 'all.smt2'
-    """An SMT2 file for all the properties"""
-
-    vmap: str = 'all.vmap'
-    """A vmap file for all the properties"""
-
-    def __post_init__(self):
-        if not self.path.is_dir():
-            raise RuntimeError(f"The path '{self.path}' is not a directory")
-
-        for basename in (self.aig, self.ywmap, self.smt2, self.vmap):
-            filepath = self.path / basename
-            if not filepath.is_file():
-                raise RuntimeError(f"The path '{filepath}' is not a file.")
-
-    def filepath(self, basename: str) -> Path:
-        """Return a Path for the given file in this directory."""
-        return self.path / basename
-
-    def open(self, rel_path: str, mode: str) -> typing.IO:
-        '''Open a file at rel_path inside the directory
-
-        If mode starts with 'w', 'x' or 'a' (so we might create a file), this
-        ensures the target directory exists.
-
-        Arguments:
-
-          rel_path:    The relative path (inside self.path) for the file to open.
-
-          mode:        The mode passed to the underlying open() call.
-        '''
-        path = self.filepath(rel_path)
-        if mode and (mode[0] in 'wxa'):
-            path.parent.mkdir(parents=True, exist_ok=True)
-        return path.open(mode)
-
-    def aig_manip_select_cmd(self,
-                             hier_pfx: str | None,
-                             out: Path,
-                             step: int,
-                             props: list[str]) -> str:
-        """Return a command to select some props from self.aig
-
-        Args:
-          hier_pfx: A prefix for SystemVerilog hierarchical names.
-          out:      The output aig file to create.
-          step:     The step number for which we are constructing the aig
-          props:    A list of the properties that should be kept
-        """
-        shared: list[str] = ["aig-manip"]
-        if hier_pfx is not None:
-            shared += [f"--hier-pfx={hier_pfx}"]
-
-        parts: list[str] = shared + [
-            str(self.filepath(self.aig)),
-            "select",
-            str(out),
-            str(self.filepath(self.ywmap)),
-            str(step)
-        ]
-
-        return ' '.join(parts + props)
-
-    def aig_manip_sim_cmd(self,
-                          witness_aiw: str,
-                          trace_vcd: str) -> str:
-        """Return a command to select some props from self.aig
-
-        Args:
-          witness_aiw: An aiw file to use as a witness.
-          trace_vcd:  A VCD file to use as a trace.
-        """
-        parts: list[str] = [
-            "aig-manip",
-            str(self.filepath(self.aig)),
-            "simulate",
-            str(self.filepath(self.ywmap)),
-            str(self.filepath(self.vmap)),
-            str(witness_aiw),
-            str(trace_vcd)
-        ]
-
-        return ' '.join(parts)
 
 '''
 Races allow async processes to cleanly run in parrallel, until one declares victory,
@@ -1120,7 +1025,6 @@ def split_step_name(name: str) -> tuple[int, str]:
 
 
 async def async_main(cfg: AppConfig,
-                     bd: BuildDir,
                      root_hash: str):
     global process_runner
 
@@ -1140,7 +1044,7 @@ async def async_main(cfg: AppConfig,
 
     log("Reading property list", c=white)
 
-    ywmap_path = bd.filepath(bd.ywmap)
+    ywmap_path = cfg.build_dir.filepath(cfg.build_dir.ywmap)
 
     with open(ywmap_path) as f:
         asserts = json.load(f).get("asserts")
@@ -1183,17 +1087,17 @@ async def async_main(cfg: AppConfig,
     match cfg.mode:
         case Mode.BMC:
             await bmc_mode(root_hash, cfg.hier_pfx, props,
-                           cfg.bmc_start, cfg.bmc_step, bd)
+                           cfg.bmc_start, cfg.bmc_step, cfg.build_dir)
         case Mode.INFO:
             await info_mode(by_step, skipped_by_step, cfg.fresh)
         case Mode.PROVE:
             await prove_mode(root_hash, cfg.hier_pfx, props, by_step,
                              cfg.fresh, cfg.start,
-                             cfg.by_step, cfg.check_complete, bd)
+                             cfg.by_step, cfg.check_complete, cfg.build_dir)
         case Mode.EXPLORE:
             await explore_mode(root_hash, cfg.hier_pfx, by_step,
                                cfg.fresh, cfg.no_store,
-                               cfg.start, cfg.hard, cfg.no_run, bd)
+                               cfg.start, cfg.hard, cfg.no_run, cfg.build_dir)
 
 
 def main() -> int:
@@ -1203,15 +1107,15 @@ def main() -> int:
         log(f"WARNING: Skipped properties are {' '.join(SKIPPED_PROPS)}",
             c=orange)
 
-    bd = BuildDir(cfg.build_dir)
-    set_logfile(bd.open('logfile.txt', 'a'))
-    set_prooflog_path(bd.filepath('prooflog.txt'))
+    set_logfile(cfg.build_dir.open('logfile.txt', 'a'))
+    set_prooflog_path(cfg.build_dir.filepath('prooflog.txt'))
 
-    ROOT_HASH = hashlib.new("sha256", bd.filepath(bd.aig).read_bytes()).hexdigest()
-    log(f"{bd.filepath(bd.aig)} has sha256 {ROOT_HASH}")
+    aig_path = cfg.build_dir.filepath(cfg.build_dir.aig)
+    ROOT_HASH = hashlib.new("sha256", aig_path.read_bytes()).hexdigest()
+    log(f"{cfg.build_dir.filepath(cfg.build_dir.aig)} has sha256 {ROOT_HASH}")
 
     try:
-        asyncio.run(async_main(cfg, bd, ROOT_HASH))
+        asyncio.run(async_main(cfg, ROOT_HASH))
     except FailedCmd as fcmd:
         print(f"Failed command (retcode {fcmd.retcode}):\n"
               f"  {fcmd.cmd}\n",
